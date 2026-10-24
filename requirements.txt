@@ -1,0 +1,6 @@
+﻿torch>=2.0
+torchvision>=0.15
+opencv-python>=4.8
+mediapipe>=0.10
+numpy>=1.24
+pygrabber>=0.2

@@ -1,0 +1,24 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Model weights (large - use Git LFS or host externally)
+models/*.pth
+
+# Output / results
+results/
+debug_eye_patch.png
+*.png
+*.jpg
+*.mp4
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
