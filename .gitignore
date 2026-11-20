@@ -1,23 +1,47 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 venv/
 .venv/
+env/
 
-# Model weights (large - use Git LFS or host externally)
+# Model weights (large files - hosted externally)
 models/*.pth
+models/*.onnx
+models/*.h5
+models/*.pt
 
-# Output / results
+# Datasets & raw video recordings (large binaries)
+datasets/
+strabismus-video/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Databases & local persistent storage
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+# Diagnostic results, generated reports & test artifacts
 results/
+diagnostics/results/
+diagnostics/samples/
 debug_eye_patch.png
 *.png
 *.jpg
-*.mp4
+*.jpeg
+*.log
 
-# OS
+# OS & Environment
 .DS_Store
 Thumbs.db
+.env
+.env.*
 
 # IDE
 .vscode/

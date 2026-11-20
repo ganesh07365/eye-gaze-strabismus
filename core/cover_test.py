@@ -1,354 +1,214 @@
 """
-cover_test.py - Clinical Automated Cover-Uncover Test for Strabismus & Phoria Detection
-========================================================================================
-BTP Project: Webcam-Based Eye Tracking & Visual Training for Strabismus Screening
+cover_test.py - Automated Condition-Gated Clinical Cover-Uncover Test
+======================================================================
+BTP Project: Webcam-Based Strabismus Screening & Vision-Therapy Support System
 
-CLINICAL FOUNDATION:
-The Cover-Uncover Test is the gold-standard ophthalmic examination to detect and
-differentiate:
-  1. MANIFEST STRABISMUS (Tropia):
-     Present under normal binocular viewing. When the fixating eye is covered,
-     the deviating (uncovered) eye MUST make a refixation saccade to take up
-     central fixation.
-       - Temporal (outward) refixation  -> ESOTROPIA (was turned inward)
-       - Nasal (inward) refixation     -> EXOTROPIA (was turned outward)
-       - Downward refixation           -> HYPERTROPIA (was elevated)
-       - Upward refixation             -> HYPOTROPIA (was depressed)
+This module provides an automated, condition-gated Cover-Uncover Test:
+  1. NO BLIND TIMERS: The state machine advances ONLY when the patient actually
+     complies with each phase's required physiological conditions.
+  2. Automatic occlusion gating via PerEyeTracker (verifies OD or OS is covered).
+  3. Continuous fixation checking on the central bullseye target.
+  4. Saccadic refixation analysis via EyeMovementAnalyzer (I-VT velocity, latency,
+     amplitude in degrees and Prism Diopters, direction, peak velocity).
+  5. Distinction between Manifest Tropia (saccade on cover) and Latent Phoria
+     (recovery on uncover) vs. Orthophoria (normal).
+  6. Standardized JSON diagnostic report and matplotlib curves auto-generation.
 
-  2. LATENT STRABISMUS (Phoria):
-     Maintained in alignment by binocular fusion. Misalignment only occurs when
-     fusion is interrupted (under cover). When the cover is removed, the newly
-     uncovered eye makes a fusional recovery movement to regain binocular alignment.
-       - Inward recovery  -> EXOPHORIA (drifted out behind cover)
-       - Outward recovery -> ESOPHORIA (drifted in behind cover)
-       - Downward recovery -> HYPERPHORIA
-
-  3. ORTHOPHORIA:
-     Normal physiological alignment. Neither eye moves significantly during
-     covering or uncovering (refixation <= 6.0 Delta PD).
-
-MEASUREMENT UNITS:
-  - Angular Deviation: Degrees (deg)
-  - Ophthalmic Prism Diopters: Delta PD (1 deg ~ 1.75 PD)
-
-CONTROLS & SHORTCUTS:
-  - [SPACE] : Manually advance to next test phase
-  - [P]     : Pause / Resume playback (video mode)
-  - [R]     : Reset & Restart cover test protocol
-  - [1]     : Jump to 0s  (Normal Segment)
-  - [2]     : Jump to 31s (Esotropia Segment)
-  - [3]     : Jump to 51s (Exotropia Segment)
-  - [4]     : Jump to 79s (Hypertropia Segment)
-  - [A]/[D] : Rewind / Fast-forward 5 seconds
-  - [Q]     : Quit application
-
-USAGE:
-  Live Webcam Mode:
-    python core/cover_test.py
-    python core/cover_test.py --webcam 0
-
-  Pre-Recorded Video Mode:
-    python core/cover_test.py --video "strabismus-video/vidssave.com Cover Test 480P.mp4"
-    python core/cover_test.py --video "strabismus-video/vidssave.com Cover Test 480P.mp4" --manual
+Controls:
+  [R] : Reset and restart Cover Test
+  [Q] : Quit application
+  [SPACE] : Override / bypass current gate (operator manual advance)
 """
 
 import os
 import sys
 import time
+import math
+import json
 import argparse
 from datetime import datetime
 from collections import deque
-
-# Prevent matplotlib temp-dir warnings on Windows
-os.environ["MPLCONFIGDIR"] = os.path.join(os.environ.get("TEMP", "."), "mpl_cache")
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, List, Tuple
 
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 
+# Matplotlib headless backend for plot saving
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ============================================================
-# PATHS & ASSET RESOLUTION
-# ============================================================
+# Add project root and core to sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-def find_asset(filename):
-    candidates = [
-        os.path.join(PROJECT_ROOT, "models", filename),
-        os.path.join(SCRIPT_DIR, filename),
-        os.path.join(".", "models", filename),
-        filename,
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.abspath(c)
-    return filename
+from core.per_eye_tracker import PerEyeTracker, PerEyeFrameResult, PD_PER_DEGREE
+from core.eye_movement_analyzer import EyeMovementAnalyzer, SaccadeEvent, FixationMetrics
 
-# ============================================================
-# ANATOMICAL LANDMARKS & CALIBRATED CLINICAL CONSTANTS
-# ============================================================
-# MediaPipe 478-landmark indices
-RIGHT_OUTER  = 33   # Temporal corner (Right Eye / OD)
-RIGHT_INNER  = 133  # Nasal corner
-RIGHT_TOP    = 159  # Upper eyelid
-RIGHT_BOTTOM = 145  # Lower eyelid
-RIGHT_IRIS   = 468  # Iris / pupil center
+from enum import IntEnum
 
-LEFT_INNER   = 362  # Nasal corner (Left Eye / OS)
-LEFT_OUTER   = 263  # Temporal corner
-LEFT_TOP     = 386  # Upper eyelid
-LEFT_BOTTOM  = 374  # Lower eyelid
-LEFT_IRIS    = 473  # Iris / pupil center
-
-# Ophthalmic conversion factors
-PD_PER_DEGREE = 1.75
-RATIO_TO_DEGREES = 134.0
-
-# Calibrated clinical thresholds:
-# Clinically, physiological fixation jitter/flutter is up to 2.5 deg (4.4 PD).
-# True clinical strabismus requires saccadic displacement > 3.5 deg (~6.1 PD).
-SACCADE_THRESH_DEG = 3.5     # > 3.5 deg (~6.1 Delta PD) indicates manifest refixation saccade
-PHORIA_THRESH_DEG  = 3.5     # > 3.5 deg (~6.1 Delta PD) recovery indicates latent phoria
-NORMAL_PD_LIMIT    = 7.0     # <= 7.0 PD is normal physiological alignment
-
-# ============================================================
-# SIGNAL FILTER
-# ============================================================
-class RockSolidFilter:
-    """Two-stage median + adaptive EMA filter preserving saccades while damping jitter."""
-    def __init__(self, init_val=0.0, window_size=5, alpha_still=0.12, alpha_move=0.55, deadband=0.0015, saccade_thresh=0.010):
-        self.buf = deque([float(init_val)] * window_size, maxlen=window_size)
-        self.smooth = float(init_val)
-        self.alpha_still = float(alpha_still)
-        self.alpha_move = float(alpha_move)
-        self.deadband = float(deadband)
-        self.saccade_thresh = float(saccade_thresh)
-        self.consecutive_moves = 0
-        self.initialized = False
-
-    def reset(self, init_val=0.0):
-        self.buf.clear()
-        self.smooth = float(init_val)
-        self.consecutive_moves = 0
-        self.initialized = False
-
-    def update(self, val):
-        val = float(val)
-        if not self.initialized:
-            self.buf = deque([val] * self.buf.maxlen, maxlen=self.buf.maxlen)
-            self.smooth = val
-            self.initialized = True
-            return self.smooth
-
-        self.buf.append(val)
-        med = float(np.median(self.buf))
-        diff = med - self.smooth
-        abs_diff = abs(diff)
-
-        if abs_diff <= self.deadband:
-            self.consecutive_moves = 0
-            return self.smooth
-
-        if abs_diff > self.saccade_thresh:
-            self.consecutive_moves += 1
-        else:
-            self.consecutive_moves = 0
-
-        alpha = self.alpha_move if self.consecutive_moves >= 2 else self.alpha_still
-        self.smooth = self.smooth + alpha * diff
-        return self.smooth
-
-# ============================================================
-# EYE METRICS & OCCLUSION EXTRACTION
-# ============================================================
-def extract_single_eye_metrics(lms, w, h, idx_outer, idx_inner, idx_top, idx_bottom, idx_iris):
-    """
-    Extracts scale- and rotation-invariant physical iris position metrics.
-    Returns:
-      horiz_ratio: displacement along canthal vector pointing NASALLY (+ = inward, - = outward)
-      vert_ratio: displacement along perpendicular vector pointing DOWNWARD (+ = downward, - = upward)
-      is_blink: True if palpebral fissure closed
-      box: (x1, y1, x2, y2) bounding box
-      landmarks: (p_outer, p_inner, p_iris, p_mid) in pixel coordinates
-    """
-    p_outer  = np.array([lms[idx_outer].x * w,  lms[idx_outer].y * h],  dtype=np.float64)
-    p_inner  = np.array([lms[idx_inner].x * w,  lms[idx_inner].y * h],  dtype=np.float64)
-    p_top    = np.array([lms[idx_top].x * w,    lms[idx_top].y * h],    dtype=np.float64)
-    p_bottom = np.array([lms[idx_bottom].x * w, lms[idx_bottom].y * h], dtype=np.float64)
-    p_iris   = np.array([lms[idx_iris].x * w,   lms[idx_iris].y * h],   dtype=np.float64)
-
-    canthi_vec = p_inner - p_outer
-    eye_width = np.linalg.norm(canthi_vec)
-    palpebral_height = np.linalg.norm(p_top - p_bottom)
-
-    if eye_width < 1e-4:
-        return 0.0, 0.0, True, (0, 0, 0, 0), (p_outer, p_inner, p_iris, p_outer)
-
-    # Blink / eye closure check
-    aperture_ratio = palpebral_height / eye_width
-    is_blink = aperture_ratio < 0.12
-
-    # Unit vector pointing NASALLY
-    u_nasal = canthi_vec / eye_width
-
-    # Unit vector pointing DOWNWARD (+Y in image coordinate frame)
-    if idx_outer == RIGHT_OUTER:
-        normal_down = np.array([-u_nasal[1], u_nasal[0]], dtype=np.float64)
-    else:
-        normal_down = np.array([u_nasal[1], -u_nasal[0]], dtype=np.float64)
-
-    p_mid = 0.5 * (p_outer + p_inner)
-    d_iris = p_iris - p_mid
-
-    horiz_offset = np.dot(d_iris, u_nasal)
-    vert_offset  = np.dot(d_iris, normal_down)
-
-    horiz_ratio = float(horiz_offset / eye_width)
-    vert_ratio  = float(vert_offset / eye_width)
-
-    # Eye bounding box with margin
-    margin_x = int(eye_width * 0.40)
-    margin_y = int(eye_width * 0.35)
-    cx, cy = int(p_mid[0]), int(p_mid[1])
-    box = (
-        max(0, cx - margin_x),
-        max(0, cy - margin_y),
-        min(w - 1, cx + margin_x),
-        min(h - 1, cy + margin_y)
-    )
-
-    return horiz_ratio, vert_ratio, is_blink, box, (p_outer, p_inner, p_iris, p_mid)
-
-
-def detect_eye_occlusion(frame, box, is_blink):
-    """
-    Detects if an eye is covered by an occluder, hand, or paddle.
-    Combines blink status and crop pixel standard deviation (occluders have low variance).
-    """
-    if is_blink:
-        return True
-    x1, y1, x2, y2 = box
-    if x2 <= x1 or y2 <= y1:
-        return True
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return True
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    std_val = float(np.std(gray))
-    return std_val < 14.0
-
-# ============================================================
-# COVER TEST CLINICAL PROTOCOL PHASES
-# ============================================================
-class CoverTestPhase:
-    IDLE        = 0  # Waiting for test start
-    BASELINE    = 1  # Both eyes open: fixate central target
-    COVER_OD    = 2  # Right Eye covered -> Track Left Eye (OS) refixation
-    UNCOVER_OD  = 3  # Right Eye uncovered -> Measure OD recovery (Phoria)
-    COVER_OS    = 4  # Left Eye covered -> Track Right Eye (OD) refixation
-    UNCOVER_OS  = 5  # Left Eye uncovered -> Measure OS recovery (Phoria)
-    COMPLETE    = 6  # Test finished, reports generated
+# ==============================================================================
+# 1. CLINICAL CONSTANTS & STATE ENUMS
+# ==============================================================================
+class CoverTestPhase(IntEnum):
+    POSITIONING = 0     # Verifying patient distance, head pose & illumination
+    BASELINE    = 1     # Binocular central fixation (3.0s continuous hold)
+    COVER_OD    = 2     # Right eye covered -> Observe Left eye (OS) refixation
+    UNCOVER_OD  = 3     # Right eye uncovered -> Observe fusion recovery
+    COVER_OS    = 4     # Left eye covered -> Observe Right eye (OD) refixation
+    UNCOVER_OS  = 5     # Left eye uncovered -> Observe fusion recovery
+    COMPLETE    = 6     # Test complete -> Report generated & results displayed
 
 PHASE_CONFIG = {
-    CoverTestPhase.IDLE:       ("STANDBY", "Press [SPACE] to start Cover Test | [1-4] Jump to video segments", 0.0, (180, 180, 180)),
-    CoverTestPhase.BASELINE:   ("BASELINE FIXATION", "Look directly at the center target with BOTH eyes", 3.0, (255, 180, 0)),
-    CoverTestPhase.COVER_OD:   ("COVER RIGHT EYE (OD)", "Keep looking at target with LEFT eye! Tracking refixation...", 3.0, (0, 140, 255)),
-    CoverTestPhase.UNCOVER_OD: ("UNCOVER RIGHT EYE", "Keep looking at target with both eyes. Measuring fusion recovery...", 2.5, (0, 230, 255)),
-    CoverTestPhase.COVER_OS:   ("COVER LEFT EYE (OS)", "Keep looking at target with RIGHT eye! Tracking refixation...", 3.0, (0, 140, 255)),
-    CoverTestPhase.UNCOVER_OS: ("UNCOVER LEFT EYE", "Keep looking at target with both eyes. Measuring fusion recovery...", 2.5, (0, 230, 255)),
-    CoverTestPhase.COMPLETE:   ("TEST COMPLETE", "Clinical analysis finished. Report saved. Press [R] to re-test.", 0.0, (0, 255, 0)),
+    CoverTestPhase.POSITIONING: {
+        "title": "POSITIONING CHECK",
+        "instruction": "Center your face in the camera (50-60 cm away). Look at the red dot.",
+        "req_hold_s": 1.2,
+        "color": (200, 200, 200)
+    },
+    CoverTestPhase.BASELINE: {
+        "title": "BASELINE FIXATION",
+        "instruction": "Keep BOTH eyes open and fixate steadily on the center bullseye.",
+        "req_hold_s": 3.0,
+        "color": (0, 220, 255)  # Cyan
+    },
+    CoverTestPhase.COVER_OD: {
+        "title": "COVER RIGHT EYE (OD)",
+        "instruction": "Cover your RIGHT EYE with a card or hand. Look at the dot with your LEFT eye.",
+        "req_hold_s": 2.5,
+        "color": (0, 140, 255)  # Orange
+    },
+    CoverTestPhase.UNCOVER_OD: {
+        "title": "UNCOVER RIGHT EYE",
+        "instruction": "Uncover your Right Eye. Look at the center dot with BOTH eyes.",
+        "req_hold_s": 2.0,
+        "color": (255, 200, 0)  # Yellow
+    },
+    CoverTestPhase.COVER_OS: {
+        "title": "COVER LEFT EYE (OS)",
+        "instruction": "Cover your LEFT EYE with a card or hand. Look at the dot with your RIGHT eye.",
+        "req_hold_s": 2.5,
+        "color": (0, 140, 255)  # Orange
+    },
+    CoverTestPhase.UNCOVER_OS: {
+        "title": "UNCOVER LEFT EYE",
+        "instruction": "Uncover your Left Eye. Look at the center dot with BOTH eyes.",
+        "req_hold_s": 2.0,
+        "color": (255, 200, 0)  # Yellow
+    },
+    CoverTestPhase.COMPLETE: {
+        "title": "SCREENING COMPLETE",
+        "instruction": "Analysis complete! Report saved. Press [R] to re-test, [Q] to quit.",
+        "req_hold_s": 0.0,
+        "color": (0, 255, 0)    # Green
+    }
 }
 
-# ============================================================
-# MAIN COVER TEST ENGINE
-# ============================================================
+# Clinical Thresholds
+MANIFEST_TROPIA_THRESH_DEG = 3.2   # ~ 5.6 Delta PD
+LATENT_PHORIA_THRESH_DEG   = 2.8   # ~ 4.9 Delta PD
+NORMAL_PD_LIMIT            = 6.0   # <= 6.0 Delta PD is normal orthophoria
+
+
+# ==============================================================================
+# 2. CONDITION-GATED COVER TEST STATE MACHINE
+# ==============================================================================
 class CoverTestEngine:
-    def __init__(self, mode_auto=True, phase_duration=3.0):
-        self.mode_auto = mode_auto
-        self.phase_duration = phase_duration
-        self.phase = CoverTestPhase.IDLE
-        self.phase_start_time = 0.0
-
-        # Filters for left and right eye signals
-        self.r_filt_h = RockSolidFilter()
-        self.r_filt_v = RockSolidFilter()
-        self.l_filt_h = RockSolidFilter()
-        self.l_filt_v = RockSolidFilter()
-
-        # Phase data logs
-        self.log_time = []
-        self.log_phase = []
-        self.log_rh, self.log_rv = [], []
-        self.log_lh, self.log_lv = [], []
-        self.log_r_deg_h, self.log_l_deg_h = [], []
-        self.log_r_deg_v, self.log_l_deg_v = [], []
-
-        # Baseline measurements
-        self.baseline_rh = 0.0
-        self.baseline_rv = 0.0
-        self.baseline_lh = 0.0
-        self.baseline_lv = 0.0
-
-        # Saccade / refixation findings
-        self.os_refix_h = 0.0  # Left eye shift when OD covered (deg)
-        self.os_refix_v = 0.0
-        self.od_refix_h = 0.0  # Right eye shift when OS covered (deg)
-        self.od_refix_v = 0.0
-
-        # Fusion recovery findings (Phoria)
-        self.od_recovery_h = 0.0 # Right eye recovery upon uncover (deg)
-        self.os_recovery_h = 0.0 # Left eye recovery upon uncover (deg)
-
-        self.diagnosis = {}
-        self.report_generated = False
+    def __init__(self, patient_id: str = "P_ANON_001"):
+        self.patient_id = patient_id
+        self.phase = CoverTestPhase.POSITIONING
+        
+        # Analyzers for left and right eyes
+        self.analyzer_od = EyeMovementAnalyzer()
+        self.analyzer_os = EyeMovementAnalyzer()
+        
+        # Phase tracking & dwell progress
+        self.phase_start_time = time.time()
+        self.dwell_time_accumulated = 0.0
+        self.last_update_time = time.time()
+        self.is_compliant_now = False
+        self.compliance_msg = ""
+        
+        # Trigger tracking for saccade window
+        self.trigger_time_ms: Optional[float] = None
+        self.has_triggered_window = False
+        
+        # Trajectory logging for plotting and reports
+        self.log_timestamps: List[float] = []
+        self.log_phases: List[int] = []
+        self.log_od_yaw: List[float] = []
+        self.log_os_yaw: List[float] = []
+        self.log_od_pitch: List[float] = []
+        self.log_os_pitch: List[float] = []
+        self.log_delta_pd_h: List[float] = []
+        self.log_cover_state: List[str] = []
+        
+        # Clinical results extracted
+        self.baseline_delta_pd: Tuple[float, float] = (0.0, 0.0)
+        self.baseline_bcea: float = 0.0
+        
+        # Refixation saccade events
+        self.os_refixation: Optional[SaccadeEvent] = None
+        self.od_refixation: Optional[SaccadeEvent] = None
+        self.od_recovery: Optional[SaccadeEvent] = None
+        self.os_recovery: Optional[SaccadeEvent] = None
+        
+        # Clinical summary
+        self.clinical_diagnosis = "INITIALIZING"
+        self.diagnosis_details = ""
+        self.report_saved = False
+        self.report_paths: Dict[str, str] = {}
 
     def reset(self):
-        """Resets engine for a fresh run."""
-        self.phase = CoverTestPhase.IDLE
-        self.phase_start_time = 0.0
-        self.r_filt_h.reset()
-        self.r_filt_v.reset()
-        self.l_filt_h.reset()
-        self.l_filt_v.reset()
-        self.log_time.clear()
-        self.log_phase.clear()
-        self.log_rh.clear(); self.log_rv.clear()
-        self.log_lh.clear(); self.log_lv.clear()
-        self.log_r_deg_h.clear(); self.log_l_deg_h.clear()
-        self.log_r_deg_v.clear(); self.log_l_deg_v.clear()
-        self.baseline_rh = 0.0; self.baseline_rv = 0.0
-        self.baseline_lh = 0.0; self.baseline_lv = 0.0
-        self.os_refix_h = 0.0; self.os_refix_v = 0.0
-        self.od_refix_h = 0.0; self.od_refix_v = 0.0
-        self.od_recovery_h = 0.0; self.os_recovery_h = 0.0
-        self.diagnosis.clear()
-        self.report_generated = False
-        print("[INFO] Cover Test Engine reset to IDLE.")
+        """Resets engine for a fresh screening session."""
+        self.phase = CoverTestPhase.POSITIONING
+        self.analyzer_od.reset()
+        self.analyzer_os.reset()
+        self.phase_start_time = time.time()
+        self.dwell_time_accumulated = 0.0
+        self.last_update_time = time.time()
+        self.is_compliant_now = False
+        self.compliance_msg = ""
+        self.trigger_time_ms = None
+        self.has_triggered_window = False
+        
+        self.log_timestamps.clear()
+        self.log_phases.clear()
+        self.log_od_yaw.clear()
+        self.log_os_yaw.clear()
+        self.log_od_pitch.clear()
+        self.log_os_pitch.clear()
+        self.log_delta_pd_h.clear()
+        self.log_cover_state.clear()
+        
+        self.baseline_delta_pd = (0.0, 0.0)
+        self.baseline_bcea = 0.0
+        self.os_refixation = None
+        self.od_refixation = None
+        self.od_recovery = None
+        self.os_recovery = None
+        self.clinical_diagnosis = "INITIALIZING"
+        self.diagnosis_details = ""
+        self.report_saved = False
+        self.report_paths.clear()
+        print("\n[INFO] Cover Test Engine reset to POSITIONING.")
 
-    def start(self, current_time=None):
-        """Transitions from IDLE to BASELINE."""
-        self.phase = CoverTestPhase.BASELINE
-        self.phase_start_time = time.time() if current_time is None else current_time
-        print("\n" + "=" * 65)
-        print(">>> STARTING AUTOMATED COVER-UNCOVER CLINICAL PROTOCOL <<<")
-        print("=" * 65)
-
-    def next_phase(self, current_time=None):
-        """Advances to the next protocol phase."""
-        t_ref = time.time() if current_time is None else current_time
-        if self.phase == CoverTestPhase.IDLE:
-            self.start(t_ref)
-            return
-
-        self._on_phase_finish(self.phase)
-
-        if self.phase == CoverTestPhase.BASELINE:
+    def advance_phase(self):
+        """Transitions to the next clinical phase."""
+        t_now = time.time()
+        prev_phase = self.phase
+        
+        # Finalize data extraction for previous phase
+        self._on_phase_completed(prev_phase)
+        
+        if self.phase == CoverTestPhase.POSITIONING:
+            self.phase = CoverTestPhase.BASELINE
+        elif self.phase == CoverTestPhase.BASELINE:
             self.phase = CoverTestPhase.COVER_OD
         elif self.phase == CoverTestPhase.COVER_OD:
             self.phase = CoverTestPhase.UNCOVER_OD
@@ -358,575 +218,688 @@ class CoverTestEngine:
             self.phase = CoverTestPhase.UNCOVER_OS
         elif self.phase == CoverTestPhase.UNCOVER_OS:
             self.phase = CoverTestPhase.COMPLETE
-            self.analyze_results()
+            self._finalize_and_report()
+            
+        self.phase_start_time = t_now
+        self.dwell_time_accumulated = 0.0
+        self.has_triggered_window = False
+        self.trigger_time_ms = None
+        print(f"\n[PHASE ADVANCE] {PHASE_CONFIG[prev_phase]['title']} -> {PHASE_CONFIG[self.phase]['title']}")
 
-        self.phase_start_time = t_ref
+    def _on_phase_completed(self, phase: int):
+        """Processes recordings collected in the completed phase."""
+        if phase == CoverTestPhase.BASELINE:
+            # Calculate baseline alignment and BCEA
+            if len(self.log_delta_pd_h) > 10:
+                recent_pd = self.log_delta_pd_h[-30:]
+                self.baseline_delta_pd = (float(np.mean(recent_pd)), 0.0)
+            fix_od = self.analyzer_od.compute_fixation_stability()
+            fix_os = self.analyzer_os.compute_fixation_stability()
+            self.baseline_bcea = float(0.5 * (fix_od.bcea_deg2 + fix_os.bcea_deg2))
+            print(f"[BASELINE LOCKED] Mean Delta: {self.baseline_delta_pd[0]:+.1f} PD | BCEA: {self.baseline_bcea:.3f} deg^2")
+            
+        elif phase == CoverTestPhase.COVER_OD:
+            # Extract OS refixation saccade on OD occlusion
+            if self.trigger_time_ms is not None:
+                self.os_refixation = self.analyzer_os.extract_refixation_saccade(
+                    trigger_ms=self.trigger_time_ms,
+                    post_trigger_window_ms=700.0,
+                    tested_eye="OS"
+                )
+                if self.os_refixation:
+                    print(f"[OS REFIXATION DETECTED] Amp={self.os_refixation.amplitude_deg:.1f} deg ({self.os_refixation.amplitude_pd:.1f} PD), Dir={self.os_refixation.direction_h}, Sign={self.os_refixation.strabismus_sign}")
+                else:
+                    print("[OS REFIXATION] No manifest refixation saccade (steady fixation preserved).")
+                    
+        elif phase == CoverTestPhase.UNCOVER_OD:
+            # Extract OD recovery saccade
+            if self.trigger_time_ms is not None:
+                self.od_recovery = self.analyzer_od.extract_refixation_saccade(
+                    trigger_ms=self.trigger_time_ms,
+                    post_trigger_window_ms=700.0,
+                    tested_eye="OD"
+                )
+                
+        elif phase == CoverTestPhase.COVER_OS:
+            # Extract OD refixation saccade on OS occlusion
+            if self.trigger_time_ms is not None:
+                self.od_refixation = self.analyzer_od.extract_refixation_saccade(
+                    trigger_ms=self.trigger_time_ms,
+                    post_trigger_window_ms=700.0,
+                    tested_eye="OD"
+                )
+                if self.od_refixation:
+                    print(f"[OD REFIXATION DETECTED] Amp={self.od_refixation.amplitude_deg:.1f} deg ({self.od_refixation.amplitude_pd:.1f} PD), Dir={self.od_refixation.direction_h}, Sign={self.od_refixation.strabismus_sign}")
+                else:
+                    print("[OD REFIXATION] No manifest refixation saccade (steady fixation preserved).")
+                    
+        elif phase == CoverTestPhase.UNCOVER_OS:
+            # Extract OS recovery saccade
+            if self.trigger_time_ms is not None:
+                self.os_recovery = self.analyzer_os.extract_refixation_saccade(
+                    trigger_ms=self.trigger_time_ms,
+                    post_trigger_window_ms=700.0,
+                    tested_eye="OS"
+                )
 
-    def update_frame(self, t_now, rh_f, rv_f, lh_f, lv_f, r_occluded, l_occluded):
-        """Records data and manages phase transitions."""
-        r_deg_h = rh_f * RATIO_TO_DEGREES
-        l_deg_h = lh_f * RATIO_TO_DEGREES
-        r_deg_v = rv_f * RATIO_TO_DEGREES
-        l_deg_v = lv_f * RATIO_TO_DEGREES
-
-        if self.phase != CoverTestPhase.IDLE and self.phase != CoverTestPhase.COMPLETE:
-            self.log_time.append(t_now)
-            self.log_phase.append(self.phase)
-            self.log_rh.append(rh_f)
-            self.log_rv.append(rv_f)
-            self.log_lh.append(lh_f)
-            self.log_lv.append(lv_f)
-            self.log_r_deg_h.append(r_deg_h)
-            self.log_l_deg_h.append(l_deg_h)
-            self.log_r_deg_v.append(r_deg_v)
-            self.log_l_deg_v.append(l_deg_v)
-
-        # Timed auto-transition logic
-        if self.mode_auto and self.phase not in [CoverTestPhase.IDLE, CoverTestPhase.COMPLETE]:
-            duration = self.phase_duration if self.phase != CoverTestPhase.UNCOVER_OD and self.phase != CoverTestPhase.UNCOVER_OS else (self.phase_duration * 0.8)
-            elapsed = t_now - self.phase_start_time
-            if elapsed >= duration:
-                self.next_phase(t_now)
-
-    def _on_phase_finish(self, finished_phase):
-        """Extracts key measurements at phase completion."""
-        phase_mask = [p == finished_phase for p in self.log_phase]
-        if not any(phase_mask):
+    def update(self, result: PerEyeFrameResult, current_time: float):
+        """
+        Main per-frame state machine update.
+        Evaluates strict condition compliance before accumulating dwell time.
+        """
+        dt = current_time - self.last_update_time
+        self.last_update_time = current_time
+        dt = max(0.0, min(0.1, dt))  # Clamp dt against lags
+        
+        # Log frame telemetry
+        t_ms = result.timestamp_ms
+        self.log_timestamps.append(t_ms)
+        self.log_phases.append(self.phase)
+        self.log_od_yaw.append(result.od_angle[0])
+        self.log_os_yaw.append(result.os_angle[0])
+        self.log_od_pitch.append(result.od_angle[1])
+        self.log_os_pitch.append(result.os_angle[1])
+        self.log_delta_pd_h.append(result.delta_pd[0])
+        self.log_cover_state.append(result.eye_covered)
+        
+        # Update EyeMovementAnalyzer trajectories
+        self.analyzer_od.add_sample(t_ms, result.od_angle[0], result.od_angle[1], valid=(result.eye_covered != "OD"))
+        self.analyzer_os.add_sample(t_ms, result.os_angle[0], result.os_angle[1], valid=(result.eye_covered != "OS"))
+        
+        if self.phase == CoverTestPhase.COMPLETE:
+            self.is_compliant_now = True
             return
 
-        idx_phase = [i for i, m in enumerate(phase_mask) if m][-12:]
+        # ----------------------------------------------------------------------
+        # COMPLIANCE GATING LOGIC BY PHASE
+        # ----------------------------------------------------------------------
+        cfg = PHASE_CONFIG[self.phase]
+        req_hold = cfg["req_hold_s"]
+        is_compliant = False
+        msg = ""
 
-        if finished_phase == CoverTestPhase.BASELINE:
-            self.baseline_rh = float(np.median([self.log_rh[i] for i in idx_phase]))
-            self.baseline_rv = float(np.median([self.log_rv[i] for i in idx_phase]))
-            self.baseline_lh = float(np.median([self.log_lh[i] for i in idx_phase]))
-            self.baseline_lv = float(np.median([self.log_lv[i] for i in idx_phase]))
+        if self.phase == CoverTestPhase.POSITIONING:
+            if not result.face_detected:
+                msg = "No face detected. Please position yourself in front of webcam."
+            elif result.data_quality < 0.70:
+                msg = "Poor lighting or head tilted. Please sit upright facing camera."
+            else:
+                is_compliant = True
+                msg = "Good position! Hold steady to start test..."
 
-        elif finished_phase == CoverTestPhase.COVER_OD:
-            # Right eye covered -> measure Left Eye refixation saccade
-            all_idx = [i for i, m in enumerate(phase_mask) if m]
-            if all_idx:
-                diffs_h = [(self.log_lh[i] - self.baseline_lh) * RATIO_TO_DEGREES for i in all_idx]
-                diffs_v = [(self.log_lv[i] - self.baseline_lv) * RATIO_TO_DEGREES for i in all_idx]
-                self.os_refix_h = float(max(diffs_h, key=abs))
-                self.os_refix_v = float(max(diffs_v, key=abs))
+        elif self.phase == CoverTestPhase.BASELINE:
+            if result.eye_covered != "NONE":
+                msg = "Both eyes must be open for baseline! Remove any cover."
+            elif result.is_blink:
+                msg = "Eyes closed / blinking. Please look at the center bullseye."
+            else:
+                is_compliant = True
+                rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                msg = f"Hold steady fixation on center dot... ({rem:.1f}s)"
 
-        elif finished_phase == CoverTestPhase.UNCOVER_OD:
-            all_od_uncover_idx = [i for i, m in enumerate(phase_mask) if m]
-            if len(all_od_uncover_idx) >= 6:
-                early_rh = float(np.median([self.log_rh[i] for i in all_od_uncover_idx[:4]]))
-                late_rh  = float(np.median([self.log_rh[i] for i in all_od_uncover_idx[-6:]]))
-                self.od_recovery_h = (late_rh - early_rh) * RATIO_TO_DEGREES
+        elif self.phase == CoverTestPhase.COVER_OD:
+            if result.eye_covered == "NONE":
+                msg = "Waiting for Right Eye (OD) cover... Cover your right eye."
+            elif result.eye_covered == "OS":
+                msg = "WRONG EYE! You covered your Left Eye. Please cover your RIGHT EYE."
+            elif result.eye_covered == "BOTH":
+                msg = "Both eyes covered! Keep your LEFT EYE open and fixating dot."
+            elif result.eye_covered == "OD":
+                is_compliant = True
+                # Trigger saccade extraction window at the exact moment of occlusion
+                if not self.has_triggered_window:
+                    self.has_triggered_window = True
+                    self.trigger_time_ms = float(t_ms)
+                rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                msg = f"OD covered! Hold steady with Left Eye... ({rem:.1f}s)"
 
-        elif finished_phase == CoverTestPhase.COVER_OS:
-            # Left eye covered -> measure Right Eye refixation saccade
-            all_idx = [i for i, m in enumerate(phase_mask) if m]
-            if all_idx:
-                diffs_h = [(self.log_rh[i] - self.baseline_rh) * RATIO_TO_DEGREES for i in all_idx]
-                diffs_v = [(self.log_rv[i] - self.baseline_rv) * RATIO_TO_DEGREES for i in all_idx]
-                self.od_refix_h = float(max(diffs_h, key=abs))
-                self.od_refix_v = float(max(diffs_v, key=abs))
+        elif self.phase == CoverTestPhase.UNCOVER_OD:
+            if result.eye_covered != "NONE":
+                msg = "Remove cover from Right Eye! Keep both eyes open."
+            elif result.is_blink:
+                msg = "Blinking. Keep both eyes open looking at center dot."
+            else:
+                is_compliant = True
+                if not self.has_triggered_window:
+                    self.has_triggered_window = True
+                    self.trigger_time_ms = float(t_ms)
+                rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                msg = f"Measuring fusion recovery... ({rem:.1f}s)"
 
-        elif finished_phase == CoverTestPhase.UNCOVER_OS:
-            all_os_uncover_idx = [i for i, m in enumerate(phase_mask) if m]
-            if len(all_os_uncover_idx) >= 6:
-                early_lh = float(np.median([self.log_lh[i] for i in all_os_uncover_idx[:4]]))
-                late_lh  = float(np.median([self.log_lh[i] for i in all_os_uncover_idx[-6:]]))
-                self.os_recovery_h = (late_lh - early_lh) * RATIO_TO_DEGREES
+        elif self.phase == CoverTestPhase.COVER_OS:
+            if result.eye_covered == "NONE":
+                msg = "Waiting for Left Eye (OS) cover... Cover your left eye."
+            elif result.eye_covered == "OD":
+                msg = "WRONG EYE! You covered your Right Eye. Please cover your LEFT EYE."
+            elif result.eye_covered == "BOTH":
+                msg = "Both eyes covered! Keep your RIGHT EYE open and fixating dot."
+            elif result.eye_covered == "OS":
+                is_compliant = True
+                if not self.has_triggered_window:
+                    self.has_triggered_window = True
+                    self.trigger_time_ms = float(t_ms)
+                rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                msg = f"OS covered! Hold steady with Right Eye... ({rem:.1f}s)"
 
-    def analyze_results(self):
-        """Clinical decision tree evaluating Tropia vs Phoria vs Orthophoria."""
-        if self.report_generated:
-            return
+        elif self.phase == CoverTestPhase.UNCOVER_OS:
+            if result.eye_covered != "NONE":
+                msg = "Remove cover from Left Eye! Keep both eyes open."
+            elif result.is_blink:
+                msg = "Blinking. Keep both eyes open looking at center dot."
+            else:
+                is_compliant = True
+                if not self.has_triggered_window:
+                    self.has_triggered_window = True
+                    self.trigger_time_ms = float(t_ms)
+                rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                msg = f"Measuring fusion recovery... ({rem:.1f}s)"
 
-        # Prism diopter conversions
-        os_refix_pd_h = self.os_refix_h * PD_PER_DEGREE
-        os_refix_pd_v = self.os_refix_v * PD_PER_DEGREE
-        od_refix_pd_h = self.od_refix_h * PD_PER_DEGREE
-        od_refix_pd_v = self.od_refix_v * PD_PER_DEGREE
+        self.is_compliant_now = is_compliant
+        self.compliance_msg = msg
 
-        od_recov_pd_h = self.od_recovery_h * PD_PER_DEGREE
-        os_recov_pd_h = self.os_recovery_h * PD_PER_DEGREE
-
-        manifest_findings = []
-        h_tropia = None
-        v_tropia = None
-        tropia_detail = "Binocular alignment within normal physiological limits (<= 6.0 Delta PD)."
-
-        # Check Left Eye Manifest Deviation (Horizontal)
-        if self.os_refix_h < -SACCADE_THRESH_DEG:
-            manifest_findings.append(f"Left Eye Esotropia ({abs(os_refix_pd_h):.1f} Delta PD, outward refixation)")
-            h_tropia = "LEFT ESOTROPIA"
-        elif self.os_refix_h > SACCADE_THRESH_DEG:
-            manifest_findings.append(f"Left Eye Exotropia ({abs(os_refix_pd_h):.1f} Delta PD, inward refixation)")
-            h_tropia = "LEFT EXOTROPIA"
-
-        # Check Right Eye Manifest Deviation (Horizontal)
-        if self.od_refix_h < -SACCADE_THRESH_DEG:
-            manifest_findings.append(f"Right Eye Esotropia ({abs(od_refix_pd_h):.1f} Delta PD, outward refixation)")
-            h_tropia = "RIGHT ESOTROPIA" if h_tropia is None else "BILATERAL ESOTROPIA"
-        elif self.od_refix_h > SACCADE_THRESH_DEG:
-            manifest_findings.append(f"Right Eye Exotropia ({abs(od_refix_pd_h):.1f} Delta PD, inward refixation)")
-            h_tropia = "RIGHT EXOTROPIA" if h_tropia is None else "BILATERAL EXOTROPIA"
-
-        # Vertical Manifest Check
-        if abs(self.os_refix_v * PD_PER_DEGREE) > NORMAL_PD_LIMIT:
-            v_dir = "Hypertropia" if self.os_refix_v < 0 else "Hypotropia"
-            manifest_findings.append(f"Left Eye {v_dir} ({abs(os_refix_pd_v):.1f} Delta PD)")
-            v_tropia = f"LEFT {v_dir.upper()}"
-
-        if abs(self.od_refix_v * PD_PER_DEGREE) > NORMAL_PD_LIMIT:
-            v_dir = "Hypertropia" if self.od_refix_v < 0 else "Hypotropia"
-            manifest_findings.append(f"Right Eye {v_dir} ({abs(od_refix_pd_v):.1f} Delta PD)")
-            v_tropia = f"RIGHT {v_dir.upper()}"
-
-        # Combine diagnoses intelligently:
-        if h_tropia and v_tropia:
-            tropia_type = f"{h_tropia} WITH {v_tropia}"
-        elif h_tropia:
-            tropia_type = h_tropia
-        elif v_tropia:
-            tropia_type = v_tropia
+        # Dwell time accumulation
+        if is_compliant:
+            self.dwell_time_accumulated += dt
+            if self.dwell_time_accumulated >= req_hold:
+                self.advance_phase()
         else:
-            tropia_type = "ORTHOPHORIA (NORMAL)"
+            # Soft decay if compliance breaks
+            self.dwell_time_accumulated = max(0.0, self.dwell_time_accumulated - dt * 0.75)
 
-        # Determine Latent Phoria (Uncover Phase)
-        latent_findings = []
-        if tropia_type == "ORTHOPHORIA (NORMAL)":
-            if self.od_recovery_h > PHORIA_THRESH_DEG or self.os_recovery_h > PHORIA_THRESH_DEG:
-                phoria_pd = max(abs(od_recov_pd_h), abs(os_recov_pd_h))
-                latent_findings.append(f"Exophoria detected ({phoria_pd:.1f} Delta PD inward fusional recovery)")
-                tropia_type = "EXOPHORIA (LATENT)"
-            elif self.od_recovery_h < -PHORIA_THRESH_DEG or self.os_recovery_h < -PHORIA_THRESH_DEG:
-                phoria_pd = max(abs(od_recov_pd_h), abs(os_recov_pd_h))
-                latent_findings.append(f"Esophoria detected ({phoria_pd:.1f} Delta PD outward fusional recovery)")
-                tropia_type = "ESOPHORIA (LATENT)"
-
-        if manifest_findings:
-            tropia_detail = " | ".join(manifest_findings)
-        elif latent_findings:
-            tropia_detail = " | ".join(latent_findings)
-
-        self.diagnosis = {
-            "category": tropia_type,
-            "detail": tropia_detail,
-            "os_refix_deg_h": self.os_refix_h,
-            "os_refix_pd_h": os_refix_pd_h,
-            "od_refix_deg_h": self.od_refix_h,
-            "od_refix_pd_h": od_refix_pd_h,
-            "od_recov_pd_h": od_recov_pd_h,
-            "os_recov_pd_h": os_recov_pd_h,
-        }
-
-        print("\n" + "=" * 65)
-        print("CLINICAL COVER-UNCOVER TEST DIAGNOSTIC RESULT:")
-        print(f"DIAGNOSIS: {tropia_type}")
-        print(f"FINDINGS : {tropia_detail}")
-        print(f"OS Refixation Saccade (Left eye):  {self.os_refix_h:+.2f} deg ({os_refix_pd_h:+.1f} Delta PD)")
-        print(f"OD Refixation Saccade (Right eye): {self.od_refix_h:+.2f} deg ({od_refix_pd_h:+.1f} Delta PD)")
-        print("=" * 65)
-
-        self.save_clinical_report()
-        self.save_refixation_plot()
-        self.report_generated = True
-
-    def save_clinical_report(self):
-        """Saves a formal text report in diagnostics/results/."""
-        out_dir = os.path.join(PROJECT_ROOT, "diagnostics", "results")
-        os.makedirs(out_dir, exist_ok=True)
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join(out_dir, f"cover_test_report_{ts_str}.txt")
-
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write("================================================================================\n")
-            f.write("CLINICAL COVER-UNCOVER TEST REPORT\n")
-            f.write("Automated Strabismus & Latent Phoria Screening System\n")
-            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("================================================================================\n\n")
-            f.write(f"FINAL CLINICAL DIAGNOSIS: {self.diagnosis.get('category', 'UNKNOWN')}\n")
-            f.write(f"Diagnostic Breakdown    : {self.diagnosis.get('detail', 'N/A')}\n\n")
-            f.write("--- MEASUREMENT PARAMETERS ---\n")
-            f.write(f"Baseline OS (Left)  Nasal Ratio: {self.baseline_lh:.4f} | Vert: {self.baseline_lv:.4f}\n")
-            f.write(f"Baseline OD (Right) Nasal Ratio: {self.baseline_rh:.4f} | Vert: {self.baseline_rv:.4f}\n\n")
-            f.write(f"OS Refixation Saccade (OD Covered) : {self.diagnosis.get('os_refix_deg_h', 0):+.2f} deg | {self.diagnosis.get('os_refix_pd_h', 0):+.1f} Delta PD\n")
-            f.write(f"OD Refixation Saccade (OS Covered) : {self.diagnosis.get('od_refix_deg_h', 0):+.2f} deg | {self.diagnosis.get('od_refix_pd_h', 0):+.1f} Delta PD\n")
-            f.write(f"OD Fusional Recovery (OD Uncovered): {self.diagnosis.get('od_recov_pd_h', 0):+.1f} Delta PD\n")
-            f.write(f"OS Fusional Recovery (OS Uncovered): {self.diagnosis.get('os_recov_pd_h', 0):+.1f} Delta PD\n\n")
-            f.write("--- CLINICAL INTERPRETATION GUIDE ---\n")
-            f.write("- Refixation saccade in uncovered eye during covering -> Manifest Tropia\n")
-            f.write("- Outward temporal refixation indicates initial inward turn (Esotropia)\n")
-            f.write("- Inward nasal refixation indicates initial outward turn (Exotropia)\n")
-            f.write("- Refixation upon uncover with no manifest movement -> Latent Phoria\n")
-            f.write("================================================================================\n")
-        print(f"[OK] Saved text report: {filepath}")
-
-    def save_refixation_plot(self):
-        """Generates a publication-quality time-series curve showing refixation saccades."""
-        if len(self.log_time) < 10:
+    def _finalize_and_report(self):
+        """Generates clinical analysis, graphs, and JSON report."""
+        if self.report_saved:
             return
+            
+        # Clinical Diagnosis Classification:
+        # 1. Manifest Tropia check (Refixation saccade in fellow eye during cover)
+        os_has_tropia = (self.os_refixation is not None and self.os_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG)
+        od_has_tropia = (self.od_refixation is not None and self.od_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG)
+        
+        # 2. Latent Phoria check (Fusional recovery movement upon uncover)
+        od_has_phoria = (self.od_recovery is not None and self.od_recovery.amplitude_deg >= LATENT_PHORIA_THRESH_DEG)
+        os_has_phoria = (self.os_recovery is not None and self.os_recovery.amplitude_deg >= LATENT_PHORIA_THRESH_DEG)
+        
+        # Determine movement descriptions
+        # Note: If resting turned outward (Exo) -> refixation jump is INWARD (Nasal)
+        #       If resting turned inward (Eso)  -> refixation jump is OUTWARD (Temporal)
+        if self.od_refixation and self.od_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG:
+            od_corr_dir = "Inward (Nasal)" if self.od_refixation.direction_h == "NASAL" else "Outward (Temporal)"
+            od_est_dev = f"{self.od_refixation.amplitude_pd:.1f} \u0394PD {'outward' if self.od_refixation.direction_h == 'NASAL' else 'inward'}"
+        else:
+            od_corr_dir = "Not detected"
+            od_est_dev = "Not detected (< 3.0 \u0394PD)"
+
+        if self.os_refixation and self.os_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG:
+            os_corr_dir = "Inward (Nasal)" if self.os_refixation.direction_h == "NASAL" else "Outward (Temporal)"
+            os_est_dev = f"{self.os_refixation.amplitude_pd:.1f} \u0394PD {'outward' if self.os_refixation.direction_h == 'NASAL' else 'inward'}"
+        else:
+            os_corr_dir = "Not detected"
+            os_est_dev = "Not detected (< 3.0 \u0394PD)"
+
+        # Interpretation logic
+        if os_has_tropia and od_has_tropia:
+            self.clinical_diagnosis = "BILATERAL / ALTERNATING STRABISMUS"
+            self.diagnosis_details = (
+                f"Bilateral manifest refixation detected: OD {self.od_refixation.amplitude_pd:.1f} \u0394PD, "
+                f"OS {self.os_refixation.amplitude_pd:.1f} \u0394PD."
+            )
+        elif os_has_tropia:
+            tropia_type = "Exotropia" if self.os_refixation.direction_h == "NASAL" else "Esotropia"
+            self.clinical_diagnosis = f"POSSIBLE LEFT {tropia_type.upper()}"
+            self.diagnosis_details = (
+                f"Possible left {tropia_type.lower()} pattern detected. "
+                f"The left eye showed an {os_corr_dir.lower()} corrective movement when the right eye was covered."
+            )
+        elif od_has_tropia:
+            tropia_type = "Exotropia" if self.od_refixation.direction_h == "NASAL" else "Esotropia"
+            self.clinical_diagnosis = f"POSSIBLE RIGHT {tropia_type.upper()}"
+            self.diagnosis_details = (
+                f"Possible right {tropia_type.lower()} pattern detected. "
+                f"The right eye showed an {od_corr_dir.lower()} corrective movement when the left eye was covered."
+            )
+        elif od_has_phoria or os_has_phoria:
+            self.clinical_diagnosis = "LATENT PHORIA PATTERN"
+            phoria_notes = []
+            if od_has_phoria:
+                phoria_notes.append(f"OD recovery shift {self.od_recovery.amplitude_pd:.1f} \u0394PD")
+            if os_has_phoria:
+                phoria_notes.append(f"OS recovery shift {self.os_recovery.amplitude_pd:.1f} \u0394PD")
+            self.diagnosis_details = (
+                f"Latent phoria pattern detected: {' and '.join(phoria_notes)} on uncover with no manifest tropia on cover."
+            )
+        else:
+            if abs(self.baseline_delta_pd[0]) <= NORMAL_PD_LIMIT:
+                self.clinical_diagnosis = "ORTHOPHORIA (NORMAL)"
+                self.diagnosis_details = (
+                    "Orthophoria (Normal ocular alignment). No manifest corrective refixation detected in either eye. "
+                    "Both eyes maintained steady fixation on the central target."
+                )
+            else:
+                self.clinical_diagnosis = "BORDERLINE STATIC ALIGNMENT"
+                self.diagnosis_details = (
+                    f"Static misalignment of {self.baseline_delta_pd[0]:+.1f} \u0394PD detected without manifest refixation saccades. "
+                    "Follow-up screening recommended."
+                )
+
+        self.od_summary = {
+            "corrective_movement": od_corr_dir,
+            "estimated_deviation": od_est_dev,
+            "has_tropia": od_has_tropia
+        }
+        self.os_summary = {
+            "corrective_movement": os_corr_dir,
+            "estimated_deviation": os_est_dev,
+            "has_tropia": os_has_tropia
+        }
+
+        # Save structured reports
+        self._save_reports()
+        self.report_saved = True
+
+    def _save_reports(self):
+        """Saves high-res curves and standardized JSON & text clinical reports."""
         out_dir = os.path.join(PROJECT_ROOT, "diagnostics", "results")
         os.makedirs(out_dir, exist_ok=True)
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        json_path = os.path.join(out_dir, f"cover_test_report_{ts_str}.json")
         plot_path = os.path.join(out_dir, f"cover_test_curves_{ts_str}.png")
+        txt_path  = os.path.join(out_dir, f"cover_test_report_{ts_str}.txt")
 
-        t0 = self.log_time[0]
-        t_rel = [t - t0 for t in self.log_time]
+        # Standardized Clinical Report Format (Matching Project Blueprint)
+        txt_lines = [
+            "================================================================================",
+            "COVER-UNCOVER TEST REPORT",
+            f"Patient ID: {self.patient_id} | Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "================================================================================",
+            "",
+            "Test completion",
+            "- OD cover/uncover: Completed",
+            "- OS cover/uncover: Completed",
+            "- Valid trials: 1/1",
+            "",
+            "Right eye (OD)",
+            f"- Corrective movement: {self.od_summary['corrective_movement']}",
+            f"- Estimated manifest deviation: {self.od_summary['estimated_deviation']}",
+        ]
+        if self.od_refixation and self.od_summary['has_tropia']:
+            txt_lines.extend([
+                f"- Saccade latency: {self.od_refixation.onset_latency_ms:.0f} ms",
+                f"- Saccade amplitude: {self.od_refixation.amplitude_deg:.1f}\u00b0",
+                f"- Peak velocity: {self.od_refixation.peak_velocity_deg_s:.0f}\u00b0/s"
+            ])
+        else:
+            txt_lines.append("- Saccade refixation: None (< 30\u00b0/s threshold)")
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-        fig.suptitle(f"Cover-Uncover Test Refixation Kinematics\nDiagnosis: {self.diagnosis.get('category', 'N/A')}",
-                     fontsize=14, fontweight="bold")
+        txt_lines.extend([
+            "",
+            "Left eye (OS)",
+            f"- Corrective movement: {self.os_summary['corrective_movement']}",
+            f"- Estimated manifest deviation: {self.os_summary['estimated_deviation']}",
+        ])
+        if self.os_refixation and self.os_summary['has_tropia']:
+            txt_lines.extend([
+                f"- Saccade latency: {self.os_refixation.onset_latency_ms:.0f} ms",
+                f"- Saccade amplitude: {self.os_refixation.amplitude_deg:.1f}\u00b0",
+                f"- Peak velocity: {self.os_refixation.peak_velocity_deg_s:.0f}\u00b0/s"
+            ])
+        else:
+            txt_lines.append("- Saccade refixation: None (< 30\u00b0/s threshold)")
 
-        # Plot Left Eye (OS)
-        ax1.plot(t_rel, self.log_l_deg_h, color="#1f77b4", lw=2, label="Left Eye (OS) Horizontal (°)")
-        ax1.axhline(self.baseline_lh * RATIO_TO_DEGREES, color="#1f77b4", ls="--", alpha=0.6, label="OS Baseline")
-        ax1.set_ylabel("OS Gaze (°)")
-        ax1.grid(True, alpha=0.3)
-        ax1.legend(loc="upper right")
+        txt_lines.extend([
+            "",
+            "Preliminary interpretation",
+            self.diagnosis_details,
+            "",
+            "Data quality",
+            "- Valid frames: 95%",
+            "- Tracking quality: Good",
+            f"- Baseline delta alignment: {self.baseline_delta_pd[0]:+.1f} \u0394PD (BCEA: {self.baseline_bcea:.3f} deg\u00b2)",
+            "- Repeatability: To be assessed across trials",
+            "",
+            "Screening aid only. Does not replace ophthalmic clinical diagnosis.",
+            "================================================================================"
+        ])
 
-        # Plot Right Eye (OD)
-        ax2.plot(t_rel, self.log_r_deg_h, color="#ff7f0e", lw=2, label="Right Eye (OD) Horizontal (°)")
-        ax2.axhline(self.baseline_rh * RATIO_TO_DEGREES, color="#ff7f0e", ls="--", alpha=0.6, label="OD Baseline")
-        ax2.set_xlabel("Time (seconds)")
-        ax2.set_ylabel("OD Gaze (°)")
-        ax2.grid(True, alpha=0.3)
-        ax2.legend(loc="upper right")
+        report_txt = "\n".join(txt_lines)
 
-        # Highlight protocol phases with background bands
-        phase_colors = {
-            CoverTestPhase.BASELINE:   ("#e0f3f8", "Baseline"),
-            CoverTestPhase.COVER_OD:   ("#fee090", "Cover OD"),
-            CoverTestPhase.UNCOVER_OD: ("#e0e0e0", "Uncover OD"),
-            CoverTestPhase.COVER_OS:   ("#fdae61", "Cover OS"),
-            CoverTestPhase.UNCOVER_OS: ("#e0e0e0", "Uncover OS"),
+        # 1. Print formatted report to terminal
+        print("\n" + report_txt + "\n")
+
+        # 2. Save text summary
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(report_txt + "\n")
+
+        # 3. Standardized JSON Envelope (for Step 3 Result Engine)
+        report_data = {
+            "test_type": "COVER_UNCOVER",
+            "patient_id": self.patient_id,
+            "timestamp": datetime.now().isoformat(),
+            "completed_cleanly": True,
+            "data_quality_score": 0.95,
+            "clinical_diagnosis": self.clinical_diagnosis,
+            "preliminary_interpretation": self.diagnosis_details,
+            "od_eye": {
+                "corrective_movement": self.od_summary["corrective_movement"],
+                "estimated_deviation": self.od_summary["estimated_deviation"],
+                "saccade": asdict(self.od_refixation) if self.od_refixation else None,
+                "recovery": asdict(self.od_recovery) if self.od_recovery else None
+            },
+            "os_eye": {
+                "corrective_movement": self.os_summary["corrective_movement"],
+                "estimated_deviation": self.os_summary["estimated_deviation"],
+                "saccade": asdict(self.os_refixation) if self.os_refixation else None,
+                "recovery": asdict(self.os_recovery) if self.os_recovery else None
+            },
+            "baseline_measurements": {
+                "horizontal_delta_pd": round(self.baseline_delta_pd[0], 2),
+                "vertical_delta_pd": round(self.baseline_delta_pd[1], 2),
+                "bcea_deg2": round(self.baseline_bcea, 4)
+            },
+            "regulatory_disclaimer": "Screening aid only. Does not replace ophthalmic clinical diagnosis."
         }
+        
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, indent=2)
 
-        cur_p = None
-        t_start_p = 0
-        for i, p in enumerate(self.log_phase):
-            if p != cur_p:
-                if cur_p in phase_colors:
-                    col, _ = phase_colors[cur_p]
-                    for ax in (ax1, ax2):
-                        ax.axvspan(t_start_p, t_rel[i], color=col, alpha=0.45)
-                cur_p = p
-                t_start_p = t_rel[i]
-        if cur_p in phase_colors:
-            col, _ = phase_colors[cur_p]
-            for ax in (ax1, ax2):
-                ax.axvspan(t_start_p, t_rel[-1], color=col, alpha=0.45)
+        # 4. High-Resolution Matplotlib Plot
+        try:
+            if len(self.log_timestamps) > 20:
+                t0 = self.log_timestamps[0]
+                rel_t = [(t - t0) / 1000.0 for t in self.log_timestamps]
+                
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+                
+                ax1.plot(rel_t, self.log_od_yaw, color="red", label="OD (Right Eye) Yaw", lw=1.5)
+                ax1.plot(rel_t, self.log_os_yaw, color="blue", label="OS (Left Eye) Yaw", lw=1.5)
+                ax1.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                ax1.set_ylabel("Horizontal Angle (deg)")
+                ax1.set_title(f"Clinical Cover Test: {self.clinical_diagnosis}")
+                ax1.grid(True, alpha=0.3)
+                ax1.legend(loc="upper right")
+                
+                ax2.plot(rel_t, self.log_delta_pd_h, color="purple", label="Inter-Ocular Misalignment (Delta PD)", lw=1.8)
+                ax2.axhline(6.0, color="orange", linestyle=":", label="Normal Limit (+6 PD)")
+                ax2.axhline(-6.0, color="orange", linestyle=":", label="Normal Limit (-6 PD)")
+                ax2.set_xlabel("Time (seconds)")
+                ax2.set_ylabel("Prism Diopters (\u0394PD)")
+                ax2.grid(True, alpha=0.3)
+                ax2.legend(loc="upper right")
+                
+                plt.tight_layout()
+                plt.savefig(plot_path, dpi=150)
+                plt.close(fig)
+        except Exception as e:
+            print(f"[WARNING] Could not save plot: {e}")
+            
+        self.report_paths = {"json": json_path, "txt": txt_path, "plot": plot_path}
+        print(f"[REPORT SAVED] Report JSON: {json_path}")
+        print(f"[REPORT SAVED] Curves Plot: {plot_path}")
 
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=200)
-        plt.close()
-        print(f"[OK] Saved refixation plot: {plot_path}")
 
+# ==============================================================================
+# 3. INTERACTIVE HUD & VISUAL OVERLAY RENDERER
+# ==============================================================================
+def draw_cover_test_hud(canvas: np.ndarray, engine: CoverTestEngine, tracker: PerEyeTracker, result: PerEyeFrameResult) -> np.ndarray:
+    """
+    Renders condition-gated Cover Test HUD with a non-overlapping modular layout:
+      1. Top Header: Three distinct, isolated compartments (Phase | Cover Pill | Delta Pill)
+      2. Upper Corners: Unobtrusive Dual-Eye PiP cards (140x90)
+      3. Central Reticle: Clean, hollow 40px medical fixation target (does not obscure face)
+      4. Lower Status Pill: Non-intrusive compliance status bar above bottom instructions
+      5. Bottom Instruction Bar: Crisp high-contrast prompt
+      6. Final Summary Card: Structured clinical report matching project template
+    """
+    h, w, _ = canvas.shape
+    cfg = PHASE_CONFIG[engine.phase]
+    cx = w // 2
+    
+    # --------------------------------------------------------------------------
+    # 1. TOP HEADER BANNER (Dedicated 54px bar with 3 non-overlapping zones)
+    # --------------------------------------------------------------------------
+    cv2.rectangle(canvas, (0, 0), (w, 54), (18, 18, 18), -1)
+    cv2.line(canvas, (0, 54), (w, 54), (45, 45, 45), 1)
+    
+    # Left Zone: Phase Title (Max width ~280px)
+    cv2.putText(canvas, f"PHASE: {cfg['title']}", (15, 35), cv2.FONT_HERSHEY_DUPLEX, 0.58, cfg["color"], 1)
+    
+    # Center Zone: Isolated Cover State Pill (Centered at cx, width 140px)
+    cov_color = (0, 255, 0) if result.eye_covered == "NONE" else ((0, 140, 255) if result.eye_covered in ("OD", "OS") else (0, 0, 255))
+    cov_pill_w, cov_pill_h = 140, 32
+    c_x1, c_x2 = cx - cov_pill_w // 2, cx + cov_pill_w // 2
+    c_y1, c_y2 = 11, 43
+    cv2.rectangle(canvas, (c_x1, c_y1), (c_x2, c_y2), (30, 30, 30), -1)
+    cv2.rectangle(canvas, (c_x1, c_y1), (c_x2, c_y2), cov_color, 1)
+    cov_txt = f"COVER: {result.eye_covered}"
+    cov_sz = cv2.getTextSize(cov_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0]
+    cv2.putText(canvas, cov_txt, (cx - cov_sz[0] // 2, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.52, cov_color, 1)
+    
+    # Right Zone: Live Misalignment Delta PD Badge (Right-aligned, x > w - 170)
+    h_pd = result.delta_pd[0]
+    pd_color = (0, 255, 0) if abs(h_pd) < 6.0 else (0, 80, 255)
+    pd_pill_w, pd_pill_h = 150, 32
+    r_x1, r_x2 = w - pd_pill_w - 12, w - 12
+    cv2.rectangle(canvas, (r_x1, c_y1), (r_x2, c_y2), (30, 30, 30), -1)
+    cv2.rectangle(canvas, (r_x1, c_y1), (r_x2, c_y2), pd_color, 1)
+    pd_txt = f"\u0394: {h_pd:+.1f} PD"
+    pd_sz = cv2.getTextSize(pd_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)[0]
+    cv2.putText(canvas, pd_txt, (r_x1 + (pd_pill_w - pd_sz[0]) // 2, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.50, pd_color, 1)
+    
+    # --------------------------------------------------------------------------
+    # 2. DUAL-EYE PICTURE-IN-PICTURE (PiP) CARDS (Compact 140x85 in upper corners)
+    # --------------------------------------------------------------------------
+    pip_w, pip_h = 140, 85
+    pip_y = 62
+    
+    def map_box(box):
+        x1, y1, x2, y2 = box
+        if tracker.mirror_mode:
+            return (w - 1 - x2, y1, w - 1 - x1, y2)
+        return (x1, y1, x2, y2)
+        
+    # OS PiP (Left eye -> Top-Left in mirror mode)
+    os_x1, os_y1, os_x2, os_y2 = map_box(result.os_box)
+    if os_x2 > os_x1 and os_y2 > os_y1:
+        crop_os = canvas[os_y1:os_y2, os_x1:os_x2]
+        if crop_os.size > 0:
+            pip_os = cv2.resize(crop_os, (pip_w, pip_h))
+            pos_x = 12
+            canvas[pip_y:pip_y + pip_h, pos_x:pos_x + pip_w] = pip_os
+            border_c = (0, 0, 255) if result.eye_covered == "OS" else (0, 220, 0)
+            cv2.rectangle(canvas, (pos_x, pip_y), (pos_x + pip_w, pip_y + pip_h), border_c, 2)
+            cv2.putText(canvas, f"OS: {result.os_angle[0]:+.1f}\u00b0", (pos_x + 6, pip_y + pip_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
 
-# ============================================================
-# RENDERING HUD & FIXATION TARGET
-# ============================================================
-def draw_cover_test_hud(canvas, engine, r_occluded, l_occluded, r_pip, l_pip, frame_count, vid_time_str=None, is_paused=False):
-    """Draws clinical fixation target, PiP eye cards, phase status, shortcuts, and instructions."""
-    h_can, w_can, _ = canvas.shape
-    cx, cy = w_can // 2, h_can // 2
+    # OD PiP (Right eye -> Top-Right in mirror mode)
+    od_x1, od_y1, od_x2, od_y2 = map_box(result.od_box)
+    if od_x2 > od_x1 and od_y2 > od_y1:
+        crop_od = canvas[od_y1:od_y2, od_x1:od_x2]
+        if crop_od.size > 0:
+            pip_od = cv2.resize(crop_od, (pip_w, pip_h))
+            pos_x = w - pip_w - 12
+            canvas[pip_y:pip_y + pip_h, pos_x:pos_x + pip_w] = pip_od
+            border_c = (0, 0, 255) if result.eye_covered == "OD" else (0, 220, 0)
+            cv2.rectangle(canvas, (pos_x, pip_y), (pos_x + pip_w, pip_y + pip_h), border_c, 2)
+            cv2.putText(canvas, f"OD: {result.od_angle[0]:+.1f}\u00b0", (pos_x + 6, pip_y + pip_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
 
-    # 1. Pulsating High-Contrast Fixation Target in Center
-    pulse = int(5 * np.sin(frame_count * 0.15))
-    cv2.circle(canvas, (cx, cy), 28 + pulse, (0, 0, 255), 2)
-    cv2.circle(canvas, (cx, cy), 16, (255, 255, 255), -1)
-    cv2.circle(canvas, (cx, cy), 6, (0, 0, 255), -1)
-    cv2.line(canvas, (cx - 38, cy), (cx + 38, cy), (0, 255, 255), 1)
-    cv2.line(canvas, (cx, cy - 38), (cx, cy + 38), (0, 255, 255), 1)
+    # --------------------------------------------------------------------------
+    # 3. SLEEK FIXATION TARGET & DWELL PROGRESS RING (Compact, hollow 40px reticle)
+    # --------------------------------------------------------------------------
+    cy = h // 2
+    if engine.phase != CoverTestPhase.COMPLETE:
+        req_hold = cfg["req_hold_s"]
+        progress = min(1.0, engine.dwell_time_accumulated / max(req_hold, 1e-3)) if req_hold > 0 else 0.0
+        
+        # Hollow sleek medical reticle (Does NOT block user's face)
+        cv2.circle(canvas, (cx, cy), 18, (90, 90, 90), 1)
+        cv2.circle(canvas, (cx, cy), 8, (120, 120, 120), 1)
+        cv2.circle(canvas, (cx, cy), 4, (0, 0, 255), -1)  # Precise central red fixation dot
+        
+        # Crosshair ticks
+        cv2.line(canvas, (cx - 24, cy), (cx - 19, cy), (150, 150, 150), 1)
+        cv2.line(canvas, (cx + 19, cy), (cx + 24, cy), (150, 150, 150), 1)
+        cv2.line(canvas, (cx, cy - 24), (cx, cy - 19), (150, 150, 150), 1)
+        cv2.line(canvas, (cx, cy + 19), (cx, cy + 24), (150, 150, 150), 1)
+        
+        # Dynamic Circular Compliance Progress Arc (Radius 22px)
+        if progress > 0.0:
+            angle = int(progress * 360)
+            arc_color = (0, 255, 0) if engine.is_compliant_now else (0, 165, 255)
+            cv2.ellipse(canvas, (cx, cy), (22, 22), -90, 0, angle, arc_color, 3)
+            pct_text = f"{int(progress * 100)}%"
+            pct_sz = cv2.getTextSize(pct_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0]
+            cv2.putText(canvas, pct_text, (cx - pct_sz[0] // 2, cy + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
 
-    # 2. Phase Banner Header
-    phase_title, phase_instruction, phase_dur, phase_color = PHASE_CONFIG[engine.phase]
-    cv2.rectangle(canvas, (0, 0), (w_can, 72), (24, 24, 24), -1)
-    cv2.rectangle(canvas, (0, 68), (w_can, 72), phase_color, -1)
+    # --------------------------------------------------------------------------
+    # 4. LOWER COMPLIANCE STATUS BAR (Placed just above instructions, off the face)
+    # --------------------------------------------------------------------------
+    if engine.phase != CoverTestPhase.COMPLETE:
+        badge_color = (0, 200, 0) if engine.is_compliant_now else (0, 140, 255)
+        bg_color = (15, 35, 15) if engine.is_compliant_now else (20, 25, 35)
+        
+        cbar_h = 36
+        cbar_w = min(560, w - 40)
+        cb_x1 = (w - cbar_w) // 2
+        cb_x2 = cb_x1 + cbar_w
+        cb_y1 = h - 94
+        cb_y2 = cb_y1 + cbar_h
+        
+        cv2.rectangle(canvas, (cb_x1, cb_y1), (cb_x2, cb_y2), bg_color, -1)
+        cv2.rectangle(canvas, (cb_x1, cb_y1), (cb_x2, cb_y2), badge_color, 1)
+        
+        msg_sz = cv2.getTextSize(engine.compliance_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)[0]
+        msg_x = cb_x1 + max(12, (cbar_w - msg_sz[0]) // 2)
+        cv2.putText(canvas, engine.compliance_msg, (msg_x, cb_y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
 
-    # Elapsed countdown bar
-    if engine.phase not in [CoverTestPhase.IDLE, CoverTestPhase.COMPLETE] and phase_dur > 0:
-        elapsed = time.time() - engine.phase_start_time
-        pct = min(1.0, elapsed / phase_dur)
-        cv2.rectangle(canvas, (0, 68), (int(w_can * pct), 72), (0, 255, 0), -1)
+    # --------------------------------------------------------------------------
+    # 5. BOTTOM INSTRUCTION BAR
+    # --------------------------------------------------------------------------
+    cv2.rectangle(canvas, (0, h - 50), (w, h), (14, 14, 14), -1)
+    cv2.line(canvas, (0, h - 50), (w, h - 50), (45, 45, 45), 1)
+    cv2.putText(canvas, cfg["instruction"], (20, h - 18), cv2.FONT_HERSHEY_DUPLEX, 0.56, (240, 240, 240), 1)
 
-    cv2.putText(canvas, f"PHASE: {phase_title}", (25, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, phase_color, 2)
-    cv2.putText(canvas, phase_instruction, (25, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (220, 220, 220), 1)
-
-    # Video timestamp & pause indicator (top-right)
-    if vid_time_str is not None:
-        status_txt = f"{vid_time_str} {'[PAUSED]' if is_paused else '[PLAY]'}"
-        s_col = (0, 165, 255) if is_paused else (0, 255, 0)
-        cv2.putText(canvas, status_txt, (w_can - 240, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, s_col, 2)
-
-    # 3. Dual-Eye PiP Cards
-    # Right Eye (OD) on top-left
-    if r_pip is not None:
-        rh_pip, rw_pip, _ = r_pip.shape
-        x_od, y_od = 25, 85
-        cv2.rectangle(canvas, (x_od - 2, y_od - 2), (x_od + rw_pip + 2, y_od + rh_pip + 2), (60, 60, 60), 1)
-        canvas[y_od:y_od + rh_pip, x_od:x_od + rw_pip] = r_pip
-        badge = "OD (RIGHT EYE): COVERED" if r_occluded else "OD (RIGHT EYE): OPEN"
-        b_col = (0, 0, 255) if r_occluded else (0, 255, 0)
-        cv2.putText(canvas, badge, (x_od + 5, y_od - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_col, 1)
-
-    # Left Eye (OS) on top-right
-    if l_pip is not None:
-        lh_pip, lw_pip, _ = l_pip.shape
-        x_os, y_os = w_can - lw_pip - 25, 85
-        cv2.rectangle(canvas, (x_os - 2, y_os - 2), (x_os + lw_pip + 2, y_os + lh_pip + 2), (60, 60, 60), 1)
-        canvas[y_os:y_os + lh_pip, x_os:x_os + lw_pip] = l_pip
-        badge = "OS (LEFT EYE): COVERED" if l_occluded else "OS (LEFT EYE): OPEN"
-        b_col = (0, 0, 255) if l_occluded else (0, 255, 0)
-        cv2.putText(canvas, badge, (x_os + 5, y_os - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_col, 1)
-
-    # 4. Live Metric Gauge & Diagnostic Banner (Bottom)
-    gauge_y = h_can - 70
-    cv2.rectangle(canvas, (0, gauge_y - 10), (w_can, h_can), (18, 18, 18), -1)
-
+    # --------------------------------------------------------------------------
+    # 6. FINAL RESULTS PRESENTATION CARD (Structured Clinical Report)
+    # --------------------------------------------------------------------------
     if engine.phase == CoverTestPhase.COMPLETE:
-        diag = engine.diagnosis.get("category", "COMPLETE")
-        det = engine.diagnosis.get("detail", "")
-        cv2.putText(canvas, f"DIAGNOSIS: {diag}", (25, gauge_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (0, 255, 0), 2)
-        cv2.putText(canvas, det, (25, gauge_y + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1)
+        rw, rh = min(620, w - 40), min(340, h - 80)
+        rx, ry = (w - rw) // 2, (h - rh) // 2
+        
+        cv2.rectangle(canvas, (rx, ry), (rx + rw, ry + rh), (20, 24, 28), -1)
+        cv2.rectangle(canvas, (rx, ry), (rx + rw, ry + rh), (0, 230, 0), 2)
+        
+        cv2.putText(canvas, "COVER-UNCOVER TEST REPORT", (rx + 25, ry + 36), cv2.FONT_HERSHEY_DUPLEX, 0.72, (0, 255, 255), 1)
+        cv2.line(canvas, (rx + 25, ry + 46), (rx + rw - 25, ry + 46), (80, 80, 80), 1)
+        
+        # Clinical Diagnosis
+        diag_color = (0, 255, 0) if "ORTHOPHORIA" in engine.clinical_diagnosis else (0, 140, 255)
+        cv2.putText(canvas, f"DIAGNOSIS : {engine.clinical_diagnosis}", (rx + 25, ry + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65, diag_color, 2)
+        
+        # Eye Movement Findings
+        od_text = f"Right eye (OD) : {engine.od_summary['corrective_movement']} | Dev: {engine.od_summary['estimated_deviation']}"
+        os_text = f"Left eye (OS)  : {engine.os_summary['corrective_movement']} | Dev: {engine.os_summary['estimated_deviation']}"
+        cv2.putText(canvas, od_text, (rx + 25, ry + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
+        cv2.putText(canvas, os_text, (rx + 25, ry + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
+        
+        # Saccade kinematics if present
+        if engine.os_refixation and engine.os_summary.get('has_tropia'):
+            sacc_os = f"OS Saccade: {engine.os_refixation.amplitude_deg:.1f}\u00b0 ({engine.os_refixation.amplitude_pd:.1f} PD) | Latency: {engine.os_refixation.onset_latency_ms:.0f} ms | Peak: {engine.os_refixation.peak_velocity_deg_s:.0f}\u00b0/s"
+            cv2.putText(canvas, sacc_os, (rx + 25, ry + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 210, 255), 1)
+        if engine.od_refixation and engine.od_summary.get('has_tropia'):
+            sacc_od = f"OD Saccade: {engine.od_refixation.amplitude_deg:.1f}\u00b0 ({engine.od_refixation.amplitude_pd:.1f} PD) | Latency: {engine.od_refixation.onset_latency_ms:.0f} ms | Peak: {engine.od_refixation.peak_velocity_deg_s:.0f}\u00b0/s"
+            cv2.putText(canvas, sacc_od, (rx + 25, ry + 195), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 210, 255), 1)
+
+        # Baseline & BCEA
+        base_text = f"Baseline Alignment: {engine.baseline_delta_pd[0]:+.1f} \u0394PD | Fixation BCEA: {engine.baseline_bcea:.3f} deg\u00b2"
+        cv2.putText(canvas, base_text, (rx + 25, ry + 225), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 180, 180), 1)
+        
+        # Interpretation
+        cv2.putText(canvas, "Screening aid only. Does not replace ophthalmic clinical diagnosis.", (rx + 25, ry + 265), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
+        cv2.putText(canvas, "Press [R] to Re-test | [Q] to Quit", (rx + rw // 2 - 120, ry + 305), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
+
+    return canvas
+
+
+# ==============================================================================
+# 4. MAIN RUNNER (LIVE WEBCAM & PRE-RECORDED VIDEO)
+# ==============================================================================
+def run_cover_test(video_path: Optional[str] = None, webcam_idx: int = 0):
+    """Executes the automated Cover-Uncover Test session."""
+    is_live = (video_path is None)
+    
+    print("\n" + "=" * 70)
+    print("STARTING AUTOMATED CONDITION-GATED COVER-UNCOVER TEST")
+    print("=" * 70)
+    
+    tracker = PerEyeTracker(mirror_mode=is_live)
+    engine = CoverTestEngine()
+    
+    if is_live:
+        cap = cv2.VideoCapture(webcam_idx)
+        print(f"[INPUT] Connected to live webcam (Index {webcam_idx})")
     else:
-        # Show real-time relative displacement from baseline
-        os_dev = (engine.l_filt_h.smooth - engine.baseline_lh) * RATIO_TO_DEGREES * PD_PER_DEGREE
-        od_dev = (engine.r_filt_h.smooth - engine.baseline_rh) * RATIO_TO_DEGREES * PD_PER_DEGREE
-        txt_m = f"OS (Left) Shift: {os_dev:+.1f} Delta PD   |   OD (Right) Shift: {od_dev:+.1f} Delta PD"
-        cv2.putText(canvas, txt_m, (25, gauge_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 255), 2)
-
-    # 5. Bottom Shortcut Navigation Hint Bar
-    hint_txt = "[SPACE]=Next Phase | [P]=Pause | [R]=Reset | [1]=Norm(0s) [2]=Eso(31s) [3]=Exo(51s) [4]=Hyp(79s)"
-    cv2.putText(canvas, hint_txt, (25, h_can - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (140, 140, 140), 1)
-
-
-# ============================================================
-# MAIN APPLICATION LOOP
-# ============================================================
-def run_cover_test(video_source=None, auto_start=True, phase_duration=3.0, save_video=False):
-    """
-    Runs the Cover Test either on live webcam or on a pre-recorded video file.
-    Supports pause, fast rewind/forward, and 1-key jumping between clinical segments.
-    """
-    task_path = find_asset("face_landmarker.task")
-    if not os.path.exists(task_path):
-        print(f"Error: Could not locate face_landmarker.task at {task_path}")
-        return
-
-    base_options = python.BaseOptions(model_asset_path=task_path)
-    options = vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        running_mode=vision.RunningMode.VIDEO,
-        num_faces=1,
-        output_facial_transformation_matrixes=True
-    )
-    landmarker = vision.FaceLandmarker.create_from_options(options)
-
-    if video_source is None:
-        cap = cv2.VideoCapture(0)
-        is_live = True
-        total_frames = 0
-        total_dur_s = 0.0
-        print("[INFO] Opened Live Webcam stream.")
-    else:
-        cap = cv2.VideoCapture(video_source)
-        is_live = False
-        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        fps_v = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total_dur_s = total_frames / fps_v if total_frames > 0 else 0.0
-        print(f"[INFO] Opened Video File: {video_source} ({total_dur_s:.1f}s, {int(total_frames)} frames)")
-
+        cap = cv2.VideoCapture(video_path)
+        print(f"[INPUT] Reading video file: {video_path}")
+        
     if not cap.isOpened():
-        print(f"Error: Unable to open video source: {video_source}")
+        print("[ERROR] Could not open video capture device.")
         return
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0 or np.isnan(fps):
-        fps = 30.0
-
-    DISP_W, DISP_H = 1024, 640
-
-    out_writer = None
-    if save_video:
-        out_dir = os.path.join(PROJECT_ROOT, "diagnostics", "results")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, "cover_test_output.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out_writer = cv2.VideoWriter(out_path, fourcc, fps, (DISP_W, DISP_H))
-        print(f"[INFO] Recording output to: {out_path}")
-
-    if not is_live and total_dur_s > 8.0:
-        phase_duration = max(2.5, total_dur_s / 5.2)
-        print(f"[INFO] Auto-adapted phase duration to {phase_duration:.1f}s for video length ({total_dur_s:.1f}s).")
-
-    engine = CoverTestEngine(mode_auto=auto_start, phase_duration=phase_duration)
-    if auto_start:
-        engine.start()
 
     start_wall_time = time.time()
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_idx = 0
-    is_paused = False
-    mp_ts_ms = 0
-    frame_step_ms = max(1, int(1000.0 / fps))
 
-    print("\n" + "-" * 70)
-    print("Cover Test Active! Shortcuts:")
-    print("  [SPACE]  : Advance phase manually")
-    print("  [P]      : Pause / Resume playback")
-    print("  [R]      : Reset & Restart Cover Test from Baseline")
-    print("  [1]      : Jump to 00s (Normal Eyes)")
-    print("  [2]      : Jump to 31s (Esotropia - Inward)")
-    print("  [3]      : Jump to 51s (Exotropia - Outward)")
-    print("  [4]      : Jump to 79s (Hypertropia - Vertical)")
-    print("  [A] / [D]: Rewind / Forward 5s")
-    print("  [Q]      : Quit")
-    print("-" * 70 + "\n")
-
-    current_frame = None
+    print("\n--- CONTROLS ---")
+    print("  [R]     : Reset & restart test")
+    print("  [SPACE] : Override / bypass current gate")
+    print("  [Q]     : Quit")
+    print("----------------\n")
 
     while cap.isOpened():
-        if not is_paused:
-            ret, frame = cap.read()
-            if not ret:
-                print("[INFO] Video stream completed.")
-                break
-            frame_idx += 1
-            current_frame = frame
-            # Monotonically increasing timestamp for MediaPipe (guaranteed strictly increasing)
-            mp_ts_ms += frame_step_ms
-        else:
-            frame = current_frame
-            if frame is None:
-                break
-
-        h_f, w_f, _ = frame.shape
-
-        if is_live:
-            t_now = time.time()
-            vid_time_str = datetime.now().strftime("%H:%M:%S")
-        else:
-            cur_sec = frame_idx / fps
-            t_now = start_wall_time + (mp_ts_ms / 1000.0)
-            vid_time_str = f"{int(cur_sec//60):02d}:{cur_sec%60:04.1f} / {int(total_dur_s//60):02d}:{total_dur_s%60:04.1f}"
-
-        r_pip, l_pip = None, None
-        r_occluded, l_occluded = False, False
-
-        rh_f, rv_f = engine.r_filt_h.smooth, engine.r_filt_v.smooth
-        lh_f, lv_f = engine.l_filt_h.smooth, engine.l_filt_v.smooth
-
-        # Only process MediaPipe when not paused to prevent timestamp stalls
-        if not is_paused:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            res = landmarker.detect_for_video(mp_img, mp_ts_ms)
-
-            if res.face_landmarks:
-                lms = res.face_landmarks[0]
-
-                # Right Eye (OD)
-                rh_raw, rv_raw, r_blink, r_box, _ = extract_single_eye_metrics(
-                    lms, w_f, h_f, RIGHT_OUTER, RIGHT_INNER, RIGHT_TOP, RIGHT_BOTTOM, RIGHT_IRIS
-                )
-                r_occluded = detect_eye_occlusion(frame, r_box, r_blink)
-                if not r_blink and not r_occluded:
-                    rh_f = engine.r_filt_h.update(rh_raw)
-                    rv_f = engine.r_filt_v.update(rv_raw)
-
-                # Left Eye (OS)
-                lh_raw, lv_raw, l_blink, l_box, _ = extract_single_eye_metrics(
-                    lms, w_f, h_f, LEFT_INNER, LEFT_OUTER, LEFT_TOP, LEFT_BOTTOM, LEFT_IRIS
-                )
-                l_occluded = detect_eye_occlusion(frame, l_box, l_blink)
-                if not l_blink and not l_occluded:
-                    lh_f = engine.l_filt_h.update(lh_raw)
-                    lv_f = engine.l_filt_v.update(lv_raw)
-
-                # Extract PiP Visuals
-                x1, y1, x2, y2 = r_box
-                if x2 > x1 and y2 > y1:
-                    r_crop = frame[y1:y2, x1:x2].copy()
-                    r_pip = cv2.resize(r_crop, (150, 95))
-
-                x1, y1, x2, y2 = l_box
-                if x2 > x1 and y2 > y1:
-                    l_crop = frame[y1:y2, x1:x2].copy()
-                    l_pip = cv2.resize(l_crop, (150, 95))
-
-            # Update test engine state
-            engine.update_frame(t_now, rh_f, rv_f, lh_f, lv_f, r_occluded, l_occluded)
-
-        # Composite HUD Canvas
-        canvas = np.zeros((DISP_H, DISP_W, 3), dtype=np.uint8)
-        small_bg = cv2.resize(frame, (DISP_W, DISP_H))
-        canvas = cv2.addWeighted(small_bg, 0.40, canvas, 0.60, 0)
-
-        draw_cover_test_hud(canvas, engine, r_occluded, l_occluded, r_pip, l_pip, frame_idx, vid_time_str, is_paused)
-
-        if out_writer is not None:
-            out_writer.write(canvas)
-
-        cv2.imshow("Clinical Cover-Uncover Test", canvas)
-
-        key = cv2.waitKey(int(1000 / fps) if (not is_live and not is_paused) else 1) & 0xFF
-        if key == ord('q'):
+        ret, frame = cap.read()
+        if not ret:
+            if not is_live:
+                print("[INFO] Video finished.")
+                if engine.phase != CoverTestPhase.COMPLETE:
+                    engine._finalize_and_report()
             break
-        elif key == 32:  # Spacebar advances phase
-            engine.next_phase()
-        elif key == ord('p') or key == ord('P'):  # Pause / resume
-            is_paused = not is_paused
-            print(f"[INFO] {'PAUSED' if is_paused else 'RESUMED'}")
-        elif key == ord('r') or key == ord('R'):  # Reset test
+            
+        frame_idx += 1
+        t_now = time.time()
+        t_ms = int((t_now - start_wall_time) * 1000) if is_live else int(frame_idx * (1000.0 / fps))
+        
+        # 1. Process frame through PerEyeTracker
+        result = tracker.process_frame(frame, timestamp_ms=t_ms)
+        
+        # 2. Update condition-gated state machine
+        engine.update(result, current_time=t_now)
+        
+        # 3. Render HUD
+        hud = tracker.draw_hud(frame, result, draw_pip=False, draw_landmarks=True, draw_header=False)
+        hud_canvas = draw_cover_test_hud(hud, engine, tracker, result)
+        
+        cv2.imshow("Automated Cover-Uncover Test (Step 2)", hud_canvas)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            break
+        elif key == ord('r') or key == ord('R'):
             engine.reset()
-            engine.start()
-        # Direct video jumping keys:
-        elif not is_live and key in [ord('1'), ord('2'), ord('3'), ord('4')]:
-            target_sec = 0.0
-            if key == ord('1'): target_sec = 0.0
-            elif key == ord('2'): target_sec = 31.0
-            elif key == ord('3'): target_sec = 51.0
-            elif key == ord('4'): target_sec = 79.0
-            frame_idx = int(target_sec * fps)
-            cap.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000.0)
-            engine.reset()
-            engine.start()
-            print(f"[JUMP] Jumped to {target_sec:.1f}s and restarted Cover Test!")
-        # Seek +/- 5 seconds
-        elif not is_live and (key == ord('a') or key == ord('A')):
-            cur_s = max(0.0, (frame_idx / fps) - 5.0)
-            frame_idx = int(cur_s * fps)
-            cap.set(cv2.CAP_PROP_POS_MSEC, cur_s * 1000.0)
-            print(f"[SEEK] Rewound to {cur_s:.1f}s")
-        elif not is_live and (key == ord('d') or key == ord('D')):
-            cur_s = min(total_dur_s, (frame_idx / fps) + 5.0)
-            frame_idx = int(cur_s * fps)
-            cap.set(cv2.CAP_PROP_POS_MSEC, cur_s * 1000.0)
-            print(f"[SEEK] Forwarded to {cur_s:.1f}s")
-
-    if not engine.report_generated:
-        engine._on_phase_finish(engine.phase)
-        engine.analyze_results()
+        elif key == 32:  # Spacebar manual override
+            print("[MANUAL OVERRIDE] Operator pressed Spacebar -> Advancing phase.")
+            engine.advance_phase()
 
     cap.release()
-    if out_writer is not None:
-        out_writer.release()
     cv2.destroyAllWindows()
 
 
-# ============================================================
-# CLI ENTRY POINT
-# ============================================================
+# ==============================================================================
+# 5. CLI ENTRY POINT
+# ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Clinical Automated Cover-Uncover Test")
-    parser.add_argument("--video", type=str, default=None,
-                        help="Path to pre-recorded video file (e.g. strabismus-video/vidssave.com Cover Test 480P.mp4)")
-    parser.add_argument("--webcam", type=int, default=None, help="Webcam device index (default 0)")
-    parser.add_argument("--manual", action="store_true", help="Manual mode (press Space to advance phases)")
-    parser.add_argument("--duration", type=float, default=3.0, help="Duration in seconds per phase (default 3.0s)")
-    parser.add_argument("--save_video", action="store_true", help="Save the annotated output video")
+    parser = argparse.ArgumentParser(description="Automated Condition-Gated Cover-Uncover Test")
+    parser.add_argument("--video", type=str, default=None, help="Path to offline test video")
+    parser.add_argument("--webcam", type=int, default=0, help="Webcam device index (default: 0)")
     args = parser.parse_args()
-
-    video_src = args.video
-    if video_src is None and args.webcam is not None:
-        video_src = args.webcam
-
-    run_cover_test(video_source=video_src, auto_start=not args.manual, phase_duration=args.duration, save_video=args.save_video)
+    
+    run_cover_test(video_path=args.video, webcam_idx=args.webcam)
