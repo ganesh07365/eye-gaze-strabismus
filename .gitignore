@@ -17,6 +17,7 @@ models/*.pt
 datasets/
 strabismus-video/
 *.mp4
+!diagnostics/samples/*.mp4
 *.avi
 *.mov
 *.mkv
@@ -30,7 +31,6 @@ data/*.db
 # Diagnostic results, generated reports & test artifacts
 results/
 diagnostics/results/
-diagnostics/samples/
 debug_eye_patch.png
 *.png
 *.jpg

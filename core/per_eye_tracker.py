@@ -144,12 +144,14 @@ class PerEyeTracker:
         screen_w: int = 1920,
         screen_h: int = 1080,
         mirror_mode: bool = True,
-        running_mode: vision.RunningMode = vision.RunningMode.VIDEO
+        running_mode: vision.RunningMode = vision.RunningMode.VIDEO,
+        auto_pad_crop: bool = False
     ):
         self.screen_w = screen_w
         self.screen_h = screen_h
         self.mirror_mode = mirror_mode
         self.running_mode = running_mode
+        self.auto_pad_crop = auto_pad_crop
 
         if model_asset_path is None or not os.path.exists(model_asset_path):
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -285,15 +287,18 @@ class PerEyeTracker:
             p90 = float(np.percentile(crop, 90))
             contrast = max(0.0, p90 - p10)
             crop_std = float(np.std(crop))
+            crop_mean = float(np.mean(crop))
         else:
             contrast = 0.0
             crop_std = 0.0
+            crop_mean = 0.0
 
         # Physiological open eye criteria:
         # 1. Aperture is at least 13% of eye width (relaxed to handle all eye shapes)
         # 2. Eye crop has texture variance (std >= 8.0, eliminating flat occluding cards/paddles)
         # 3. Dynamic contrast >= 14.0 (dark pupil vs bright sclera/skin)
-        is_open = (aperture >= 0.13) and (crop_std >= 8.0) and (contrast >= 14.0)
+        # 4. Crop mean brightness >= 35.0 (eliminating dark opaque occluders)
+        is_open = (aperture >= 0.13) and (crop_std >= 8.0) and (contrast >= 14.0) and (crop_mean >= 35.0)
 
         return {
             "yaw_deg": yaw_deg,
@@ -301,6 +306,7 @@ class PerEyeTracker:
             "aperture": aperture,
             "contrast": contrast,
             "crop_std": crop_std,
+            "crop_mean": crop_mean,
             "is_open": is_open,
             "iris_width_px": iris_width_px,
             "mm_per_px": mm_per_px,
@@ -327,7 +333,22 @@ class PerEyeTracker:
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        # ROI brightness difference for paddle occluder detection
+        l_roi = gray[int(h*0.2):int(h*0.8), :int(w*0.45)]
+        r_roi = gray[int(h*0.2):int(h*0.8), int(w*0.55):]
+        roi_diff = float(np.mean(r_roi) - np.mean(l_roi)) if l_roi.size > 0 and r_roi.size > 0 else 0.0
+
+        if self.auto_pad_crop:
+            pad_t = int(h * 0.45)
+            pad_b = int(h * 0.45)
+            pad_l = int(w * 0.25)
+            pad_r = int(w * 0.25)
+            padded = cv2.copyMakeBorder(rgb, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=[128, 128, 128])
+            ph_h, ph_w = padded.shape[:2]
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=padded)
+        else:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
         if self.running_mode == vision.RunningMode.VIDEO:
             detection_result = self.detector.detect_for_video(mp_image, timestamp_ms)
@@ -335,14 +356,34 @@ class PerEyeTracker:
             detection_result = self.detector.detect(mp_image)
 
         if not detection_result.face_landmarks:
-            self.cover_history.append("NONE")
+            raw_cover = "NONE"
+            if roi_diff > 25: raw_cover = "OD"
+            elif roi_diff < -25: raw_cover = "OS"
+            self.cover_history.append(raw_cover)
             return PerEyeFrameResult(
                 timestamp_ms=timestamp_ms,
+                eye_covered=raw_cover,
                 fps=self.fps,
                 face_detected=False
             )
 
-        lms = detection_result.face_landmarks[0]
+        raw_lms = detection_result.face_landmarks[0]
+        if self.auto_pad_crop:
+            class UnpadLandmark:
+                def __init__(self, x, y, z=0.0):
+                    self.x = x
+                    self.y = y
+                    self.z = z
+            lms = [
+                UnpadLandmark(
+                    x=(lm.x * ph_w - pad_l) / w,
+                    y=(lm.y * ph_h - pad_t) / h,
+                    z=lm.z
+                )
+                for lm in raw_lms
+            ]
+        else:
+            lms = raw_lms
 
         # Extract 3D head pose
         head_matrix = None
@@ -368,12 +409,15 @@ class PerEyeTracker:
             is_right_eye=False
         )
 
-        # Robust Occlusion Logic:
-        # If one eye is open and the fellow eye is closed/occluded -> Flag covered eye!
+        # Robust Multi-cue Occlusion Logic:
         od_open = od["is_open"]
         os_open = os_eye["is_open"]
 
-        if od_open and not os_open:
+        if roi_diff > 25:
+            raw_cover = "OD"
+        elif roi_diff < -25:
+            raw_cover = "OS"
+        elif od_open and not os_open:
             raw_cover = "OS"
         elif os_open and not od_open:
             raw_cover = "OD"

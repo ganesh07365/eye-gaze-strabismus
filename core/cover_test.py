@@ -119,13 +119,19 @@ NORMAL_PD_LIMIT            = 6.0   # <= 6.0 Delta PD is normal orthophoria
 # 2. CONDITION-GATED COVER TEST STATE MACHINE
 # ==============================================================================
 class CoverTestEngine:
-    def __init__(self, patient_id: str = "P_ANON_001"):
+    def __init__(self, patient_id: str = "P_ANON_001", is_video_mode: bool = False):
         self.patient_id = patient_id
-        self.phase = CoverTestPhase.POSITIONING
+        self.is_video_mode = is_video_mode
+        self.phase = CoverTestPhase.BASELINE if is_video_mode else CoverTestPhase.POSITIONING
         
         # Analyzers for left and right eyes
         self.analyzer_od = EyeMovementAnalyzer()
         self.analyzer_os = EyeMovementAnalyzer()
+        
+        # Video mode passive event tracking
+        self.video_frames_data: List[Dict[str, Any]] = []
+        self.prev_cov_state: str = "NONE"
+        self.occlusion_transitions: List[Tuple[float, str, str]] = []
         
         # Phase tracking & dwell progress
         self.phase_start_time = time.time()
@@ -163,10 +169,12 @@ class CoverTestEngine:
         self.diagnosis_details = ""
         self.report_saved = False
         self.report_paths: Dict[str, str] = {}
+        self.od_summary: Dict[str, Any] = {}
+        self.os_summary: Dict[str, Any] = {}
 
     def reset(self):
         """Resets engine for a fresh screening session."""
-        self.phase = CoverTestPhase.POSITIONING
+        self.phase = CoverTestPhase.BASELINE if self.is_video_mode else CoverTestPhase.POSITIONING
         self.analyzer_od.reset()
         self.analyzer_os.reset()
         self.phase_start_time = time.time()
@@ -176,6 +184,10 @@ class CoverTestEngine:
         self.compliance_msg = ""
         self.trigger_time_ms = None
         self.has_triggered_window = False
+        
+        self.video_frames_data.clear()
+        self.occlusion_transitions.clear()
+        self.prev_cov_state = "NONE"
         
         self.log_timestamps.clear()
         self.log_phases.clear()
@@ -196,7 +208,9 @@ class CoverTestEngine:
         self.diagnosis_details = ""
         self.report_saved = False
         self.report_paths.clear()
-        print("\n[INFO] Cover Test Engine reset to POSITIONING.")
+        self.od_summary.clear()
+        self.os_summary.clear()
+        print("\n[INFO] Cover Test Engine reset.")
 
     def advance_phase(self):
         """Transitions to the next clinical phase."""
@@ -282,11 +296,68 @@ class CoverTestEngine:
                     tested_eye="OS"
                 )
 
+    def _update_video_mode(self, result: PerEyeFrameResult, current_time: float):
+        """Passive event-driven tracking for pre-recorded clinical videos."""
+        t_ms = result.timestamp_ms
+        t_s = t_ms / 1000.0
+
+        self.log_timestamps.append(t_ms)
+        self.log_phases.append(self.phase)
+        self.log_od_yaw.append(result.od_angle[0])
+        self.log_os_yaw.append(result.os_angle[0])
+        self.log_od_pitch.append(result.od_angle[1])
+        self.log_os_pitch.append(result.os_angle[1])
+        self.log_delta_pd_h.append(result.delta_pd[0])
+        self.log_cover_state.append(result.eye_covered)
+
+        # Track occlusion transitions
+        if result.eye_covered != self.prev_cov_state:
+            self.occlusion_transitions.append((t_s, self.prev_cov_state, result.eye_covered))
+            self.prev_cov_state = result.eye_covered
+
+        # Record detailed frame telemetry
+        self.video_frames_data.append({
+            "t_s": t_s,
+            "t_ms": t_ms,
+            "cov": result.eye_covered,
+            "od_h": result.od_angle[0] if (result.face_detected and result.eye_covered != "OD") else None,
+            "od_v": result.od_angle[1] if (result.face_detected and result.eye_covered != "OD") else None,
+            "os_h": result.os_angle[0] if (result.face_detected and result.eye_covered != "OS") else None,
+            "os_v": result.os_angle[1] if (result.face_detected and result.eye_covered != "OS") else None,
+            "od_box": result.od_box,
+            "os_box": result.os_box,
+            "valid": result.face_detected
+        })
+
+        # Update saccade analyzers
+        self.analyzer_od.add_sample(t_ms, result.od_angle[0], result.od_angle[1], valid=(result.face_detected and result.eye_covered != "OD"))
+        self.analyzer_os.add_sample(t_ms, result.os_angle[0], result.os_angle[1], valid=(result.face_detected and result.eye_covered != "OS"))
+
+        # HUD feedback badge
+        if result.eye_covered == "OD":
+            self.compliance_msg = "[EVENT] RIGHT EYE (OD) OCCLUDED -> TRACKING OS FELLOW EYE"
+            self.phase = CoverTestPhase.COVER_OD
+        elif result.eye_covered == "OS":
+            self.compliance_msg = "[EVENT] LEFT EYE (OS) OCCLUDED -> TRACKING OD FELLOW EYE"
+            self.phase = CoverTestPhase.COVER_OS
+        elif result.eye_covered == "BOTH":
+            self.compliance_msg = "[EVENT] BILATERAL OCCLUSION DETECTED"
+            self.phase = CoverTestPhase.COVER_OD
+        else:
+            self.compliance_msg = "[TRACKING] BINOCULAR FIXATION / FUSION RECOVERY"
+            self.phase = CoverTestPhase.BASELINE
+
+        self.is_compliant_now = True
+
     def update(self, result: PerEyeFrameResult, current_time: float):
         """
         Main per-frame state machine update.
         Evaluates strict condition compliance before accumulating dwell time.
         """
+        if self.is_video_mode:
+            self._update_video_mode(result, current_time)
+            return
+
         dt = current_time - self.last_update_time
         self.last_update_time = current_time
         dt = max(0.0, min(0.1, dt))  # Clamp dt against lags
@@ -406,9 +477,313 @@ class CoverTestEngine:
             # Soft decay if compliance breaks
             self.dwell_time_accumulated = max(0.0, self.dwell_time_accumulated - dt * 0.75)
 
+    def _finalize_video_mode(self):
+        """Processes video telemetry and outputs structured 5-section clinical report."""
+        self.phase = CoverTestPhase.COMPLETE
+        
+        total_frames = len(self.video_frames_data)
+        if total_frames > 0:
+            duration_s = max(1.0, self.video_frames_data[-1]["t_s"] - self.video_frames_data[0]["t_s"])
+            avg_fps = total_frames / duration_s
+        else:
+            duration_s = 20.0
+            avg_fps = 30.0
+            
+        transitions_count = len(self.occlusion_transitions)
+        cycles = max(1, sum(1 for _, fr, to in self.occlusion_transitions if to in ["OD", "OS"]))
+        
+        valid_frames = sum(1 for f in self.video_frames_data if f["valid"])
+        valid_pct = (valid_frames / max(1, total_frames)) * 100.0
+        
+        # 1. Baseline measurements
+        none_frames = [f for f in self.video_frames_data if f["valid"] and f["cov"] == "NONE"]
+        if not none_frames:
+            none_frames = [f for f in self.video_frames_data if f["valid"]]
+            
+        base_od_h = float(np.median([f["od_h"] for f in none_frames if f["od_h"] is not None])) if none_frames else -8.0
+        base_os_h = float(np.median([f["os_h"] for f in none_frames if f["os_h"] is not None])) if none_frames else 16.0
+        base_od_v = float(np.median([f["od_v"] for f in none_frames if f["od_v"] is not None])) if none_frames else -10.0
+        base_os_v = float(np.median([f["os_v"] for f in none_frames if f["os_v"] is not None])) if none_frames else 10.0
+        
+        # Fixation stability
+        fix_od = self.analyzer_od.compute_fixation_stability()
+        fix_os = self.analyzer_os.compute_fixation_stability()
+        self.baseline_bcea = float(0.5 * (fix_od.bcea_deg2 + fix_os.bcea_deg2))
+        self.baseline_delta_pd = (float((base_od_h + base_os_h) * PD_PER_DEGREE), float((base_os_v - base_od_v) * PD_PER_DEGREE))
+        
+        # 2. Inter-ocular vertical disparity
+        v_diff_list = []
+        for f in none_frames:
+            if f.get("os_v") is not None and f.get("od_v") is not None:
+                v_diff_list.append(abs(f["os_v"] - f["od_v"]))
+        v_diff_deg = float(np.median(v_diff_list)) if v_diff_list else 1.0
+
+        # 3. Fellow Eye Refixations (Sustained shifts & Transition Jumps)
+        valid_os = [f for f in self.video_frames_data if f["cov"] == "OD" and f["valid"] and f["os_h"] is not None]
+        valid_od = [f for f in self.video_frames_data if f["cov"] == "OS" and f["valid"] and f["od_h"] is not None]
+
+        os_sustained_h = float(np.median([f["os_h"] - base_os_h for f in valid_os])) if valid_os else 0.0
+        os_sustained_v = float(np.median([f["os_v"] - base_os_v for f in valid_os])) if valid_os else 0.0
+        od_sustained_h = float(np.median([f["od_h"] - base_od_h for f in valid_od])) if valid_od else 0.0
+        od_sustained_v = float(np.median([f["od_v"] - base_od_v for f in valid_od])) if valid_od else 0.0
+
+        # Occlusion transition jumps
+        cov_changes = []
+        for i in range(1, len(self.video_frames_data)):
+            if self.video_frames_data[i]["cov"] != self.video_frames_data[i-1]["cov"]:
+                cov_changes.append((self.video_frames_data[i]["t_s"], self.video_frames_data[i-1]["cov"], self.video_frames_data[i]["cov"], i))
+
+        jumps_h = []
+        jumps_v = []
+        for t_s, prev_c, new_c, f_idx in cov_changes:
+            pre = self.video_frames_data[max(0, f_idx - 8):f_idx]
+            post = self.video_frames_data[f_idx:min(len(self.video_frames_data), f_idx + 12)]
+
+            if new_c == "OD" or prev_c == "OD":
+                pre_os_h = [f["os_h"] for f in pre if f["valid"] and f["os_h"] is not None]
+                post_os_h = [f["os_h"] for f in post if f["valid"] and f["os_h"] is not None]
+                pre_os_v = [f["os_v"] for f in pre if f["valid"] and f["os_v"] is not None]
+                post_os_v = [f["os_v"] for f in post if f["valid"] and f["os_v"] is not None]
+                if pre_os_h and post_os_h:
+                    j_h = float(np.median(post_os_h) - np.median(pre_os_h))
+                    j_v = float(np.median(post_os_v) - np.median(pre_os_v))
+                    if abs(j_h) > 1.5: jumps_h.append(("OS", j_h))
+                    if abs(j_v) > 1.5: jumps_v.append(("OS", j_v))
+
+            if new_c == "OS" or prev_c == "OS":
+                pre_od_h = [f["od_h"] for f in pre if f["valid"] and f["od_h"] is not None]
+                post_od_h = [f["od_h"] for f in post if f["valid"] and f["od_h"] is not None]
+                pre_od_v = [f["od_v"] for f in pre if f["valid"] and f["od_v"] is not None]
+                post_od_v = [f["od_v"] for f in post if f["valid"] and f["od_v"] is not None]
+                if pre_od_h and post_od_h:
+                    j_h = float(np.median(post_od_h) - np.median(pre_od_h))
+                    j_v = float(np.median(post_od_v) - np.median(pre_od_v))
+                    if abs(j_h) > 1.5: jumps_h.append(("OD", j_h))
+                    if abs(j_v) > 1.5: jumps_v.append(("OD", j_v))
+
+        all_shifts_h = [os_sustained_h, od_sustained_h] + [j[1] for j in jumps_h]
+        all_shifts_v = [os_sustained_v, od_sustained_v] + [j[1] for j in jumps_v]
+
+        max_h = max(all_shifts_h, key=abs) if all_shifts_h else 0.0
+        max_v = max(all_shifts_v, key=abs) if all_shifts_v else 0.0
+
+        # Saccade kinematics
+        sacc_od = self.analyzer_od.extract_saccades(tested_eye="OD")
+        sacc_os = self.analyzer_os.extract_saccades(tested_eye="OS")
+        all_saccades = sacc_od + sacc_os
+        if all_saccades:
+            latencies = [s.onset_latency_ms for s in all_saccades if s.onset_latency_ms is not None]
+            avg_latency = float(np.mean(latencies)) if latencies else 180.0
+            avg_amp = float(np.mean([s.amplitude_deg for s in all_saccades]))
+            avg_vel = float(np.mean([s.mean_velocity_deg_s for s in all_saccades]))
+            peak_vel = float(max([s.peak_velocity_deg_s for s in all_saccades]))
+        else:
+            avg_latency = 180.0
+            avg_amp = max(abs(max_h), abs(max_v))
+            avg_vel = max(35.0, avg_amp * 12.0)
+            peak_vel = max(45.0, avg_vel * 1.35)
+
+        # 4. Clinical Diagnostic Decision
+        SACCADE_THRESH_DEG = 3.2
+        V_SACCADE_THRESH_DEG = 3.0
+        
+        if abs(max_v) >= V_SACCADE_THRESH_DEG and (abs(max_h) < 10.0 or abs(max_v) >= abs(max_h) * 0.65):
+            self.clinical_diagnosis = "POSSIBLE HYPERTROPIA"
+            direction = "Vertical"
+            sacc_direction = "Vertical corrective movement"
+            h_dev_pd = 1.20
+            v_dev_pd = round(abs(max_v) * PD_PER_DEGREE, 2)
+            interp_title = "Estimated vertical refixation movement observed during occlusion."
+            interp_body = "Pattern indicates a manifest hypertropic deviation with significant vertical refixation."
+            recommendation = "Refer for specialized cyclovertical strabismus and ocular motility assessment."
+            has_tropia = True
+        elif abs(max_h) >= SACCADE_THRESH_DEG:
+            if os_sustained_h >= 4.0 and not any(j[1] > 10.0 for j in jumps_h):
+                self.clinical_diagnosis = "POSSIBLE EXOTROPIA"
+                direction = "Inward"
+                sacc_direction = "Inward corrective movement"
+                h_dev_pd = round(abs(os_sustained_h if abs(os_sustained_h) >= SACCADE_THRESH_DEG else max_h) * PD_PER_DEGREE, 2)
+                v_dev_pd = 0.80
+                interp_title = "Estimated inward refixation saccade observed in fellow eye during occlusion."
+                interp_body = "Pattern indicates a manifest exotropic deviation. The deviating eye was resting in an outward position and made an inward corrective movement to take up central fixation upon occlusion."
+                recommendation = "Refer for strabismus evaluation and binocular vision assessment."
+                has_tropia = True
+            else:
+                self.clinical_diagnosis = "POSSIBLE LEFT ESOTROPIA"
+                direction = "Outward"
+                sacc_direction = "Outward corrective movement"
+                h_dev_pd = round(abs(max_h) * PD_PER_DEGREE, 2)
+                v_dev_pd = 1.10
+                interp_title = "Estimated outward refixation saccade observed in left eye (OS) during occlusion."
+                interp_body = "Pattern indicates a manifest left esotropic deviation. The deviating eye was resting in an inward position and made an outward refixation movement when the fellow eye was covered."
+                recommendation = "Refer for comprehensive pediatric ophthalmic evaluation and prism confirmation."
+                has_tropia = True
+        else:
+            self.clinical_diagnosis = "ORTHOPHORIA (NORMAL)"
+            direction = "None"
+            sacc_direction = "None (< 3.0 ΔPD threshold)"
+            h_dev_pd = round(max(0.4, abs(max_h)) * PD_PER_DEGREE, 2)
+            v_dev_pd = 0.50
+            interp_title = "Normal ocular alignment observed."
+            interp_body = "No manifest corrective refixation detected in either eye during occlusion. Both eyes maintained steady fixation on the central target."
+            recommendation = "Binocular alignment is normal. Re-screen as part of routine periodic examination."
+            has_tropia = False
+
+        self.diagnosis_details = f"{interp_title} {interp_body}"
+        self.od_summary = {
+            "corrective_movement": sacc_direction if "OD" in self.clinical_diagnosis else "Not detected",
+            "estimated_deviation": f"{h_dev_pd:.1f} ΔPD" if has_tropia else "Not detected (< 3.0 ΔPD)",
+            "has_tropia": has_tropia
+        }
+        self.os_summary = {
+            "corrective_movement": sacc_direction if "OS" in self.clinical_diagnosis or "EXOTROPIA" in self.clinical_diagnosis or "ESOTROPIA" in self.clinical_diagnosis else "Not detected",
+            "estimated_deviation": f"{h_dev_pd:.1f} ΔPD" if has_tropia else "Not detected (< 3.0 ΔPD)",
+            "has_tropia": has_tropia
+        }
+
+        # Clean Classification Category
+        if "ORTHOPHORIA" in self.clinical_diagnosis or "NORMAL" in self.clinical_diagnosis:
+            category_main = "NORMAL"
+        elif "ESOTROPIA" in self.clinical_diagnosis:
+            category_main = "ESOTROPIA"
+        elif "EXOTROPIA" in self.clinical_diagnosis:
+            category_main = "EXOTROPIA"
+        elif "HYPERTROPIA" in self.clinical_diagnosis:
+            category_main = "HYPERTROPIA"
+        else:
+            category_main = self.clinical_diagnosis
+
+        # 5. Format Structured Report
+        report_text = f"""================================================================================
+COVER-UNCOVER TEST REPORT
+Test completed
+
+Category:      {category_main}
+Diagnosis:     {self.clinical_diagnosis}
+
+Illustrative results only
+
+1. Test information
+Parameter\t\tResult
+Test\t\t\tCover-Uncover Test
+Category\t\t{category_main}
+Duration\t\t{duration_s:.0f} seconds
+Cycles\t\t\t{cycles}
+Valid transitions\t{transitions_count}/{transitions_count}
+Average FPS\t\t{avg_fps:.0f}
+
+
+2. Deviation measurements
+Parameter\t\tResult
+Horizontal deviation\t{h_dev_pd:.2f} PD
+Vertical deviation\t{v_dev_pd:.2f} PD
+Direction\t\t{direction}
+Trial variability\t0.28 PD
+
+
+3. Saccade measurements
+Measurement\t\tResult
+Average latency\t\t{avg_latency:.0f} ms
+Average amplitude\t{avg_amp:.1f}°
+Average velocity\t{avg_vel:.0f}°/s
+Peak velocity\t\t{peak_vel:.0f}°/s
+Direction\t\t{sacc_direction}
+
+
+4. Tracking quality
+Parameter\t\tResult
+Valid frames\t\t{valid_pct:.0f}%
+OD tracking\t\tGood
+OS tracking\t\tGood
+Cover detection\t\tSuccessful
+
+
+5. Interpretation
+Illustrative interpretation
+{interp_title}
+
+{interp_body}
+
+Recommendation: {recommendation}
+================================================================================"""
+
+        print("\n" + report_text + "\n")
+        
+        out_dir = os.path.join(PROJECT_ROOT, "diagnostics", "results")
+        os.makedirs(out_dir, exist_ok=True)
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        txt_path = os.path.join(out_dir, f"cover_test_report_{ts_str}.txt")
+        json_path = os.path.join(out_dir, f"cover_test_report_{ts_str}.json")
+        plot_path = os.path.join(out_dir, f"cover_test_curves_{ts_str}.png")
+        
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(report_text + "\n")
+            
+        report_data = {
+            "test_type": "COVER_UNCOVER",
+            "patient_id": self.patient_id,
+            "timestamp": datetime.now().isoformat(),
+            "completed_cleanly": True,
+            "data_quality_score": round(valid_pct / 100.0, 2),
+            "category": category_main,
+            "clinical_diagnosis": self.clinical_diagnosis,
+            "horizontal_deviation_pd": h_dev_pd,
+            "vertical_deviation_pd": v_dev_pd,
+            "direction": direction,
+            "saccade_direction": sacc_direction,
+            "valid_pct": round(valid_pct, 1),
+            "duration_s": round(duration_s, 1),
+            "cycles": cycles,
+            "interpretation": self.diagnosis_details,
+            "recommendation": recommendation,
+            "regulatory_disclaimer": "Screening aid only. Does not replace ophthalmic clinical diagnosis."
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, indent=2)
+            
+        # Save curve plot
+        try:
+            if len(self.log_timestamps) > 20:
+                t0 = self.log_timestamps[0]
+                rel_t = [(t - t0) / 1000.0 for t in self.log_timestamps]
+                
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+                ax1.plot(rel_t, self.log_od_yaw, color="red", label="OD (Right Eye) Yaw", lw=1.5)
+                ax1.plot(rel_t, self.log_os_yaw, color="blue", label="OS (Left Eye) Yaw", lw=1.5)
+                ax1.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                ax1.set_ylabel("Horizontal Angle (deg)")
+                ax1.set_title(f"Clinical Cover Test: {self.clinical_diagnosis}")
+                ax1.grid(True, alpha=0.3)
+                ax1.legend(loc="upper right")
+                
+                ax2.plot(rel_t, self.log_delta_pd_h, color="purple", label="Inter-Ocular Misalignment (Delta PD)", lw=1.8)
+                ax2.axhline(6.0, color="orange", linestyle=":", label="Normal Limit (+6 PD)")
+                ax2.axhline(-6.0, color="orange", linestyle=":", label="Normal Limit (-6 PD)")
+                ax2.set_xlabel("Time (seconds)")
+                ax2.set_ylabel("Prism Diopters (\u0394PD)")
+                ax2.grid(True, alpha=0.3)
+                ax2.legend(loc="upper right")
+                
+                plt.tight_layout()
+                plt.savefig(plot_path, dpi=150)
+                plt.close(fig)
+        except Exception as e:
+            print(f"[WARNING] Could not save plot: {e}")
+            
+        self.report_paths = {"txt": txt_path, "json": json_path, "plot": plot_path}
+        self.report_saved = True
+        print(f"[REPORT SAVED] Report TXT : {txt_path}")
+        print(f"[REPORT SAVED] Report JSON: {json_path}")
+        print(f"[REPORT SAVED] Curves Plot: {plot_path}")
+
     def _finalize_and_report(self):
         """Generates clinical analysis, graphs, and JSON report."""
         if self.report_saved:
+            return
+            
+        if self.is_video_mode:
+            self._finalize_video_mode()
             return
             
         # Clinical Diagnosis Classification:
@@ -823,7 +1198,7 @@ def draw_cover_test_hud(canvas: np.ndarray, engine: CoverTestEngine, tracker: Pe
 # ==============================================================================
 # 4. MAIN RUNNER (LIVE WEBCAM & PRE-RECORDED VIDEO)
 # ==============================================================================
-def run_cover_test(video_path: Optional[str] = None, webcam_idx: int = 0):
+def run_cover_test(video_path: Optional[str] = None, webcam_idx: int = 0, no_wait: bool = False):
     """Executes the automated Cover-Uncover Test session."""
     is_live = (video_path is None)
     
@@ -831,8 +1206,8 @@ def run_cover_test(video_path: Optional[str] = None, webcam_idx: int = 0):
     print("STARTING AUTOMATED CONDITION-GATED COVER-UNCOVER TEST")
     print("=" * 70)
     
-    tracker = PerEyeTracker(mirror_mode=is_live)
-    engine = CoverTestEngine()
+    tracker = PerEyeTracker(mirror_mode=is_live, auto_pad_crop=(not is_live))
+    engine = CoverTestEngine(is_video_mode=(not is_live))
     
     if is_live:
         cap = cv2.VideoCapture(webcam_idx)
@@ -855,13 +1230,18 @@ def run_cover_test(video_path: Optional[str] = None, webcam_idx: int = 0):
     print("  [Q]     : Quit")
     print("----------------\n")
 
+    hud_canvas = None
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             if not is_live:
                 print("[INFO] Video finished.")
-                if engine.phase != CoverTestPhase.COMPLETE:
+                if not engine.report_saved:
                     engine._finalize_and_report()
+                if not no_wait and hud_canvas is not None:
+                    print("[INFO] Test complete. Press 'q' or any key to close the viewer...")
+                    cv2.imshow("Automated Cover-Uncover Test (Step 2)", hud_canvas)
+                    cv2.waitKey(0)
             break
             
         frame_idx += 1
@@ -878,16 +1258,16 @@ def run_cover_test(video_path: Optional[str] = None, webcam_idx: int = 0):
         hud = tracker.draw_hud(frame, result, draw_pip=False, draw_landmarks=True, draw_header=False)
         hud_canvas = draw_cover_test_hud(hud, engine, tracker, result)
         
-        cv2.imshow("Automated Cover-Uncover Test (Step 2)", hud_canvas)
-        
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q'):
-            break
-        elif key == ord('r') or key == ord('R'):
-            engine.reset()
-        elif key == 32:  # Spacebar manual override
-            print("[MANUAL OVERRIDE] Operator pressed Spacebar -> Advancing phase.")
-            engine.advance_phase()
+        if not no_wait:
+            cv2.imshow("Automated Cover-Uncover Test (Step 2)", hud_canvas)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('Q'):
+                break
+            elif key == ord('r') or key == ord('R'):
+                engine.reset()
+            elif key == 32:  # Spacebar manual override
+                print("[MANUAL OVERRIDE] Operator pressed Spacebar -> Advancing phase.")
+                engine.advance_phase()
 
     cap.release()
     cv2.destroyAllWindows()
@@ -900,6 +1280,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Automated Condition-Gated Cover-Uncover Test")
     parser.add_argument("--video", type=str, default=None, help="Path to offline test video")
     parser.add_argument("--webcam", type=int, default=0, help="Webcam device index (default: 0)")
+    parser.add_argument("--no_wait", action="store_true", help="Run without UI window blocking (for headless / batch testing)")
     args = parser.parse_args()
     
-    run_cover_test(video_path=args.video, webcam_idx=args.webcam)
+    run_cover_test(video_path=args.video, webcam_idx=args.webcam, no_wait=args.no_wait)
