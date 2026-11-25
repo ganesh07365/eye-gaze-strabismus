@@ -36,6 +36,7 @@ debug_eye_patch.png
 *.jpg
 *.jpeg
 *.log
+scratch/
 
 # OS & Environment
 .DS_Store
