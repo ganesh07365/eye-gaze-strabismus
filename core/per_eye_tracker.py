@@ -293,11 +293,50 @@ class PerEyeTracker:
             crop_std = 0.0
             crop_mean = 0.0
 
+        # Tight palpebral slit iris-vs-sclera check (detects hand/skin/card occlusion
+        # even when MediaPipe projects open-eye landmarks onto the occluding hand)
+        iris_r = max(2.0, 0.5 * iris_width_px)
+        ex1 = int(max(0, min(po[0], pi[0]) + 0.08 * canthi_dist))
+        ex2 = int(min(w - 1, max(po[0], pi[0]) - 0.08 * canthi_dist))
+        ey_mid = 0.5 * (pt[1] + pb[1])
+        ey1 = int(max(0, ey_mid - 0.35 * palp_h))
+        ey2 = int(min(h - 1, ey_mid + 0.35 * palp_h))
+
+        ix, iy = int(round(p_iris[0])), int(round(p_iris[1]))
+        ir = max(2, int(round(iris_r * 0.65)))
+        iris_patch = gray[max(0, iy - ir):min(h, iy + ir + 1), max(0, ix - ir):min(w, ix + ir + 1)]
+
+        if iris_patch.size > 4 and ex2 > ex1 + 2 and ey2 >= ey1:
+            slit = gray[ey1:ey2 + 1, ex1:ex2 + 1]
+            # 35th percentile ignores small corneal specular glints on real open eyes
+            iris_dark = float(np.percentile(iris_patch, 35))
+            flank_vals = []
+            l_x2 = int(p_iris[0] - iris_r * 0.85)
+            r_x1 = int(p_iris[0] + iris_r * 0.85)
+            if l_x2 > ex1 + 1:
+                flank_vals.append(float(np.percentile(gray[ey1:ey2 + 1, ex1:l_x2], 75)))
+            if ex2 > r_x1 + 1:
+                flank_vals.append(float(np.percentile(gray[ey1:ey2 + 1, r_x1:ex2], 75)))
+            sclera_bright = max(flank_vals) if flank_vals else float(np.percentile(slit, 85))
+            sclera_iris_drop = sclera_bright - iris_dark
+            iris_michelson = sclera_iris_drop / max(sclera_bright + iris_dark, 1.0)
+        else:
+            sclera_iris_drop = 0.0
+            iris_michelson = 0.0
+
+        has_iris_sclera = (iris_michelson >= 0.16) and (sclera_iris_drop >= 12.0)
+
         # Physiological open eye criteria:
         # 1. Aperture is at least 13% of eye width (palpebral fissure height / canthal distance)
         # 2. Eye crop is not a pitch-black occluder (crop_mean >= 15.0)
         # 3. Eye crop has texture / contrast (not a completely flat card/paddle)
-        is_open = (aperture >= 0.13) and (crop_mean >= 15.0) and (contrast >= 6.0 or crop_std >= 4.0)
+        # 4. Dark-iris vs bright-sclera signature present (rejects hand/finger skin occlusion)
+        is_open = (
+            (aperture >= 0.13)
+            and (crop_mean >= 15.0)
+            and (contrast >= 6.0 or crop_std >= 4.0)
+            and has_iris_sclera
+        )
 
         return {
             "yaw_deg": yaw_deg,
@@ -306,6 +345,8 @@ class PerEyeTracker:
             "contrast": contrast,
             "crop_std": crop_std,
             "crop_mean": crop_mean,
+            "iris_michelson": iris_michelson,
+            "sclera_iris_drop": sclera_iris_drop,
             "is_open": is_open,
             "iris_width_px": iris_width_px,
             "mm_per_px": mm_per_px,
@@ -416,8 +457,18 @@ class PerEyeTracker:
         od_open = od["is_open"]
         os_open = os_eye["is_open"]
 
+        # Inter-ocular iris-visibility asymmetry check (catches textured fingers/hand edges
+        # when one eye remains clearly open while the covered eye's iris-sclera contrast collapses)
+        if od_open and os_open:
+            m_od, m_os = od["iris_michelson"], os_eye["iris_michelson"]
+            d_od, d_os = od["sclera_iris_drop"], os_eye["sclera_iris_drop"]
+            if m_os >= 0.25 and d_os >= 20.0 and m_od < 0.35 * m_os and m_od < 0.22:
+                od_open = False
+            elif m_od >= 0.25 and d_od >= 20.0 and m_os < 0.35 * m_od and m_os < 0.22:
+                os_open = False
+
         # Multi-cue Occlusion & Eye-Closure Logic:
-        # 1. Direct ocular openness (aperture EAR, iris boundary, and texture)
+        # 1. Direct ocular openness (aperture EAR, iris boundary, and iris-sclera structure)
         if od_open and not os_open:
             raw_cover = "OS"
         elif os_open and not od_open:
