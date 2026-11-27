@@ -186,6 +186,7 @@ class PerEyeTracker:
         self.filter_os_pitch = RockSolidFilter()
         self.filter_od_iris_px = RockSolidFilter(window_size=5, alpha_still=0.10, alpha_move=0.35, deadband=0.15, saccade_thresh=2.0)
         self.filter_os_iris_px = RockSolidFilter(window_size=5, alpha_still=0.10, alpha_move=0.35, deadband=0.15, saccade_thresh=2.0)
+        self.filter_binocular_iris_px = RockSolidFilter(window_size=5, alpha_still=0.10, alpha_move=0.35, deadband=0.15, saccade_thresh=2.0)
         self.filter_screen_x = RockSolidFilter(init_val=screen_w / 2, alpha_still=0.30, alpha_move=0.90)
         self.filter_screen_y = RockSolidFilter(init_val=screen_h / 2, alpha_still=0.30, alpha_move=0.90)
 
@@ -204,6 +205,7 @@ class PerEyeTracker:
         self.filter_os_pitch.reset()
         self.filter_od_iris_px.reset()
         self.filter_os_iris_px.reset()
+        self.filter_binocular_iris_px.reset()
         self.filter_screen_x.reset(self.screen_w / 2)
         self.filter_screen_y.reset(self.screen_h / 2)
         self.cover_history.clear()
@@ -269,9 +271,11 @@ class PerEyeTracker:
         p_mid = 0.5 * (po + pi)
         d_iris_vec = p_iris - p_mid
 
-        # Displacements in mm
-        d_horiz_mm = float(np.dot(d_iris_vec, u_nasal)) * mm_per_px
-        d_vert_mm  = float(np.dot(d_iris_vec, u_down)) * mm_per_px
+        # Displacements in pixels and mm
+        d_horiz_px = float(np.dot(d_iris_vec, u_nasal))
+        d_vert_px  = float(np.dot(d_iris_vec, u_down))
+        d_horiz_mm = d_horiz_px * mm_per_px
+        d_vert_mm  = d_vert_px * mm_per_px
 
         # Eyeball spherical kinematics: theta = arcsin(clamp(d / R))
         norm_h = max(-0.95, min(0.95, d_horiz_mm / EYEBALL_RADIUS_MM))
@@ -354,8 +358,11 @@ class PerEyeTracker:
             "iris_michelson": iris_michelson,
             "sclera_iris_drop": sclera_iris_drop,
             "is_open": is_open,
+            "raw_iris_px": raw_iris_px,
             "iris_width_px": iris_width_px,
             "mm_per_px": mm_per_px,
+            "d_horiz_px": d_horiz_px,
+            "d_vert_px": d_vert_px,
             "box": box,
             "iris_px": (float(p_iris[0]), float(p_iris[1]))
         }
@@ -487,6 +494,20 @@ class PerEyeTracker:
             raw_cover = "OS"
         else:
             raw_cover = "NONE"
+
+        # Unify binocular iris pixel scale when both eyes are open & uncovered so OD and OS
+        # share the exact same physical ruler (prevents asymmetric gain in wide maximized gaze)
+        if od_open and os_open:
+            shared_iris_px = self.filter_binocular_iris_px.update(
+                0.5 * (od["raw_iris_px"] + os_eye["raw_iris_px"])
+            )
+            shared_mm_per_px = HUMAN_IRIS_DIAMETER_MM / max(shared_iris_px, 1.0)
+            for eye_d in (od, os_eye):
+                nh = max(-0.95, min(0.95, (eye_d["d_horiz_px"] * shared_mm_per_px) / EYEBALL_RADIUS_MM))
+                nv = max(-0.95, min(0.95, (eye_d["d_vert_px"] * shared_mm_per_px) / EYEBALL_RADIUS_MM))
+                eye_d["yaw_deg"] = math.degrees(math.asin(nh))
+                eye_d["pitch_deg"] = math.degrees(math.asin(nv))
+                eye_d["mm_per_px"] = shared_mm_per_px
 
         # Update 3-frame rolling queue (majority vote gives ~66ms zero-lag response)
         self.cover_history.append(raw_cover)

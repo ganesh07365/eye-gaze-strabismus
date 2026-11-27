@@ -110,9 +110,12 @@ PHASE_CONFIG = {
 }
 
 # Clinical Thresholds
-MANIFEST_TROPIA_THRESH_DEG = 3.2   # ~ 5.6 Delta PD
-LATENT_PHORIA_THRESH_DEG   = 2.8   # ~ 4.9 Delta PD
-NORMAL_PD_LIMIT            = 6.0   # <= 6.0 Delta PD is normal orthophoria
+MANIFEST_TROPIA_THRESH_DEG   = 5.2    # ~ 9.1 Delta PD horizontal threshold (clears ~4.4 deg hand-occlusion mesh warp)
+VERTICAL_TROPIA_THRESH_DEG   = 4.5    # ~ 7.9 Delta PD vertical threshold (avoids blink/eyelid twitch)
+LATENT_PHORIA_THRESH_DEG     = 4.0    # ~ 7.0 Delta PD (avoids physiological < 7 PD near exophoria)
+MIN_LIVE_REFIXATION_PEAK_VEL = 75.0   # deg/s (matched to 30 FPS central-diff velocity for >= ~5 deg saccade)
+MIN_LIVE_REFIXATION_LATENCY  = 90.0   # ms (rejects premature < 90 ms hand-entry artifacts)
+NORMAL_PD_LIMIT              = 6.0    # <= 6.0 Delta PD is normal orthophoria
 
 
 # ==============================================================================
@@ -240,6 +243,59 @@ class CoverTestEngine:
         self.trigger_time_ms = None
         print(f"\n[PHASE ADVANCE] {PHASE_CONFIG[prev_phase]['title']} -> {PHASE_CONFIG[self.phase]['title']}")
 
+    def _validate_live_refixation(
+        self,
+        analyzer: EyeMovementAnalyzer,
+        sac: Optional[SaccadeEvent],
+        trigger_ms: float,
+        thresh_h: float,
+        thresh_v: float
+    ) -> Optional[SaccadeEvent]:
+        """
+        Filters out slow hand-entry face-mesh shifts, transient bounce-back spikes,
+        and small vertical eyelid twitches so only genuine refixation saccades pass.
+        """
+        if sac is None:
+            return None
+
+        # Reject premature hand-entry artifacts before physiological visual-saccade latency
+        if sac.onset_latency_ms is None or sac.onset_latency_ms < MIN_LIVE_REFIXATION_LATENCY:
+            return None
+
+        h_abs = abs(sac.amplitude_h_deg)
+        v_abs = abs(sac.amplitude_v_deg)
+
+        # Must exceed axis-specific clinical threshold (never count vertical blink as horizontal squint)
+        is_horiz = (h_abs >= thresh_h) and (h_abs >= v_abs or sac.strabismus_sign in ("ESOTROPIA", "EXOTROPIA"))
+        is_vert = (v_abs >= thresh_v) and (v_abs > h_abs) and (sac.strabismus_sign in ("HYPERTROPIA", "HYPOTROPIA"))
+        if not (is_horiz or is_vert):
+            return None
+
+        # Reject slow hand-entry landmark drift
+        if sac.peak_velocity_deg_s < MIN_LIVE_REFIXATION_PEAK_VEL:
+            return None
+
+        # Verify sustained fixation shift & reject transient overshoot spikes
+        t_arr = np.array(analyzer.timestamps)
+        val_arr = np.array(analyzer.is_valid)
+        arr = np.array(analyzer.yaw_deg if is_horiz else analyzer.pitch_deg)
+        pre_mask = val_arr & (t_arr >= trigger_ms - 800.0) & (t_arr <= trigger_ms - 100.0)
+        post_mask = val_arr & (t_arr >= sac.end_time_ms + 100.0) & (t_arr <= sac.end_time_ms + 1300.0)
+        if np.sum(pre_mask) >= 5 and np.sum(post_mask) >= 5:
+            pre_med = float(np.median(arr[pre_mask]))
+            post_med = float(np.median(arr[post_mask]))
+            net_shift = abs(post_med - pre_med)
+            axis_amp = h_abs if is_horiz else v_abs
+            if net_shift < 0.6 * axis_amp:
+                return None
+            spike_mask = val_arr & (t_arr >= sac.start_time_ms) & (t_arr <= sac.end_time_ms + 60.0)
+            if np.any(spike_mask):
+                peak_exc = float(np.max(np.abs(arr[spike_mask] - pre_med)))
+                if peak_exc > 1.75 * max(net_shift, 1.0):
+                    return None
+
+        return sac
+
     def _on_phase_completed(self, phase: int):
         """Processes recordings collected in the completed phase."""
         if phase == CoverTestPhase.BASELINE:
@@ -255,10 +311,14 @@ class CoverTestEngine:
         elif phase == CoverTestPhase.COVER_OD:
             # Extract OS refixation saccade on OD occlusion
             if self.trigger_time_ms is not None:
-                self.os_refixation = self.analyzer_os.extract_refixation_saccade(
+                raw_sac = self.analyzer_os.extract_refixation_saccade(
                     trigger_ms=self.trigger_time_ms,
                     post_trigger_window_ms=700.0,
                     tested_eye="OS"
+                )
+                self.os_refixation = self._validate_live_refixation(
+                    self.analyzer_os, raw_sac, self.trigger_time_ms,
+                    MANIFEST_TROPIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
                 )
                 if self.os_refixation:
                     print(f"[OS REFIXATION DETECTED] Amp={self.os_refixation.amplitude_deg:.1f} deg ({self.os_refixation.amplitude_pd:.1f} PD), Dir={self.os_refixation.direction_h}, Sign={self.os_refixation.strabismus_sign}")
@@ -268,19 +328,27 @@ class CoverTestEngine:
         elif phase == CoverTestPhase.UNCOVER_OD:
             # Extract OD recovery saccade
             if self.trigger_time_ms is not None:
-                self.od_recovery = self.analyzer_od.extract_refixation_saccade(
+                raw_rec = self.analyzer_od.extract_refixation_saccade(
                     trigger_ms=self.trigger_time_ms,
                     post_trigger_window_ms=700.0,
                     tested_eye="OD"
+                )
+                self.od_recovery = self._validate_live_refixation(
+                    self.analyzer_od, raw_rec, self.trigger_time_ms,
+                    LATENT_PHORIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
                 )
                 
         elif phase == CoverTestPhase.COVER_OS:
             # Extract OD refixation saccade on OS occlusion
             if self.trigger_time_ms is not None:
-                self.od_refixation = self.analyzer_od.extract_refixation_saccade(
+                raw_sac = self.analyzer_od.extract_refixation_saccade(
                     trigger_ms=self.trigger_time_ms,
                     post_trigger_window_ms=700.0,
                     tested_eye="OD"
+                )
+                self.od_refixation = self._validate_live_refixation(
+                    self.analyzer_od, raw_sac, self.trigger_time_ms,
+                    MANIFEST_TROPIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
                 )
                 if self.od_refixation:
                     print(f"[OD REFIXATION DETECTED] Amp={self.od_refixation.amplitude_deg:.1f} deg ({self.od_refixation.amplitude_pd:.1f} PD), Dir={self.od_refixation.direction_h}, Sign={self.od_refixation.strabismus_sign}")
@@ -290,10 +358,14 @@ class CoverTestEngine:
         elif phase == CoverTestPhase.UNCOVER_OS:
             # Extract OS recovery saccade
             if self.trigger_time_ms is not None:
-                self.os_recovery = self.analyzer_os.extract_refixation_saccade(
+                raw_rec = self.analyzer_os.extract_refixation_saccade(
                     trigger_ms=self.trigger_time_ms,
                     post_trigger_window_ms=700.0,
                     tested_eye="OS"
+                )
+                self.os_recovery = self._validate_live_refixation(
+                    self.analyzer_os, raw_rec, self.trigger_time_ms,
+                    LATENT_PHORIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
                 )
 
     def _update_video_mode(self, result: PerEyeFrameResult, current_time: float):
@@ -786,31 +858,37 @@ Recommendation: {recommendation}
             self._finalize_video_mode()
             return
             
-        # Clinical Diagnosis Classification:
-        # 1. Manifest Tropia check (Refixation saccade in fellow eye during cover)
-        os_has_tropia = (self.os_refixation is not None and self.os_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG)
-        od_has_tropia = (self.od_refixation is not None and self.od_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG)
-        
-        # 2. Latent Phoria check (Fusional recovery movement upon uncover)
-        od_has_phoria = (self.od_recovery is not None and self.od_recovery.amplitude_deg >= LATENT_PHORIA_THRESH_DEG)
-        os_has_phoria = (self.os_recovery is not None and self.os_recovery.amplitude_deg >= LATENT_PHORIA_THRESH_DEG)
-        
-        # Determine movement descriptions
-        # Note: If resting turned outward (Exo) -> refixation jump is INWARD (Nasal)
-        #       If resting turned inward (Eso)  -> refixation jump is OUTWARD (Temporal)
-        if self.od_refixation and self.od_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG:
-            od_corr_dir = "Inward (Nasal)" if self.od_refixation.direction_h == "NASAL" else "Outward (Temporal)"
-            od_est_dev = f"{self.od_refixation.amplitude_pd:.1f} \u0394PD {'outward' if self.od_refixation.direction_h == 'NASAL' else 'inward'}"
-        else:
-            od_corr_dir = "Not detected"
-            od_est_dev = "Not detected (< 3.0 \u0394PD)"
+        # Clinical Diagnosis Classification (axis-aware):
+        def _describe_refixation(sac: Optional[SaccadeEvent], thresh_h: float, thresh_v: float):
+            if sac is None:
+                return False, None, "Not detected", "Not detected (< 3.0 \u0394PD)"
+            h_abs, v_abs = abs(sac.amplitude_h_deg), abs(sac.amplitude_v_deg)
+            if v_abs >= thresh_v and v_abs > h_abs and sac.strabismus_sign in ("HYPERTROPIA", "HYPOTROPIA"):
+                t_type = sac.strabismus_sign.capitalize()
+                corr = "Downward" if sac.direction_v == "DOWNWARD" else "Upward"
+                dev = f"{v_abs * PD_PER_DEGREE:.1f} \u0394PD {'upward' if sac.direction_v == 'DOWNWARD' else 'downward'}"
+                return True, t_type, corr, dev
+            if h_abs >= thresh_h:
+                if sac.direction_h == "NASAL":
+                    return True, "Exotropia", "Inward (Nasal)", f"{h_abs * PD_PER_DEGREE:.1f} \u0394PD outward"
+                return True, "Esotropia", "Outward (Temporal)", f"{h_abs * PD_PER_DEGREE:.1f} \u0394PD inward"
+            return False, None, "Not detected", "Not detected (< 3.0 \u0394PD)"
 
-        if self.os_refixation and self.os_refixation.amplitude_deg >= MANIFEST_TROPIA_THRESH_DEG:
-            os_corr_dir = "Inward (Nasal)" if self.os_refixation.direction_h == "NASAL" else "Outward (Temporal)"
-            os_est_dev = f"{self.os_refixation.amplitude_pd:.1f} \u0394PD {'outward' if self.os_refixation.direction_h == 'NASAL' else 'inward'}"
-        else:
-            os_corr_dir = "Not detected"
-            os_est_dev = "Not detected (< 3.0 \u0394PD)"
+        # 1. Manifest Tropia check (Refixation saccade in fellow eye during cover)
+        os_has_tropia, os_tropia_type, os_corr_dir, os_est_dev = _describe_refixation(
+            self.os_refixation, MANIFEST_TROPIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
+        )
+        od_has_tropia, od_tropia_type, od_corr_dir, od_est_dev = _describe_refixation(
+            self.od_refixation, MANIFEST_TROPIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
+        )
+
+        # 2. Latent Phoria check (Fusional recovery movement upon uncover)
+        od_has_phoria, _, _, _ = _describe_refixation(
+            self.od_recovery, LATENT_PHORIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
+        )
+        os_has_phoria, _, _, _ = _describe_refixation(
+            self.os_recovery, LATENT_PHORIA_THRESH_DEG, VERTICAL_TROPIA_THRESH_DEG
+        )
 
         # Interpretation logic
         if os_has_tropia and od_has_tropia:
@@ -819,43 +897,34 @@ Recommendation: {recommendation}
                 f"Bilateral manifest refixation detected: OD {self.od_refixation.amplitude_pd:.1f} \u0394PD, "
                 f"OS {self.os_refixation.amplitude_pd:.1f} \u0394PD."
             )
-        elif os_has_tropia:
-            tropia_type = "Exotropia" if self.os_refixation.direction_h == "NASAL" else "Esotropia"
-            self.clinical_diagnosis = f"POSSIBLE LEFT {tropia_type.upper()}"
+        elif os_has_tropia and os_tropia_type:
+            self.clinical_diagnosis = f"POSSIBLE LEFT {os_tropia_type.upper()}"
             self.diagnosis_details = (
-                f"Possible left {tropia_type.lower()} pattern detected. "
-                f"The left eye showed an {os_corr_dir.lower()} corrective movement when the right eye was covered."
+                f"Possible left {os_tropia_type.lower()} pattern detected. "
+                f"The left eye showed a {os_corr_dir.lower()} corrective movement when the right eye was covered."
             )
-        elif od_has_tropia:
-            tropia_type = "Exotropia" if self.od_refixation.direction_h == "NASAL" else "Esotropia"
-            self.clinical_diagnosis = f"POSSIBLE RIGHT {tropia_type.upper()}"
+        elif od_has_tropia and od_tropia_type:
+            self.clinical_diagnosis = f"POSSIBLE RIGHT {od_tropia_type.upper()}"
             self.diagnosis_details = (
-                f"Possible right {tropia_type.lower()} pattern detected. "
-                f"The right eye showed an {od_corr_dir.lower()} corrective movement when the left eye was covered."
+                f"Possible right {od_tropia_type.lower()} pattern detected. "
+                f"The right eye showed a {od_corr_dir.lower()} corrective movement when the left eye was covered."
             )
         elif od_has_phoria or os_has_phoria:
             self.clinical_diagnosis = "LATENT PHORIA PATTERN"
             phoria_notes = []
-            if od_has_phoria:
+            if od_has_phoria and self.od_recovery:
                 phoria_notes.append(f"OD recovery shift {self.od_recovery.amplitude_pd:.1f} \u0394PD")
-            if os_has_phoria:
+            if os_has_phoria and self.os_recovery:
                 phoria_notes.append(f"OS recovery shift {self.os_recovery.amplitude_pd:.1f} \u0394PD")
             self.diagnosis_details = (
                 f"Latent phoria pattern detected: {' and '.join(phoria_notes)} on uncover with no manifest tropia on cover."
             )
         else:
-            if abs(self.baseline_delta_pd[0]) <= NORMAL_PD_LIMIT:
-                self.clinical_diagnosis = "ORTHOPHORIA (NORMAL)"
-                self.diagnosis_details = (
-                    "Orthophoria (Normal ocular alignment). No manifest corrective refixation detected in either eye. "
-                    "Both eyes maintained steady fixation on the central target."
-                )
-            else:
-                self.clinical_diagnosis = "BORDERLINE STATIC ALIGNMENT"
-                self.diagnosis_details = (
-                    f"Static misalignment of {self.baseline_delta_pd[0]:+.1f} \u0394PD detected without manifest refixation saccades. "
-                    "Follow-up screening recommended."
-                )
+            self.clinical_diagnosis = "ORTHOPHORIA (NORMAL)"
+            self.diagnosis_details = (
+                "Orthophoria (Normal ocular alignment). No manifest corrective refixation detected in either eye. "
+                "Both eyes maintained steady fixation on the central target."
+            )
 
         self.od_summary = {
             "corrective_movement": od_corr_dir,

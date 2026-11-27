@@ -82,9 +82,21 @@ TOTAL_TRANSITIONS = TOTAL_ACT_CYCLES * 2  # 8 total half-cycle steps
 SWITCH_GRACE_WINDOW_SEC = 0.60             # Transfer grace period across the nose
 
 # Clinical Thresholds
-NORMAL_TOTAL_PD_LIMIT = 4.0      # <= 4.0 Delta PD total deviation is normal orthophoria
-BORDERLINE_PD_LIMIT   = 8.0      # 4.0 - 8.0 Delta PD indicates mild/moderate phoria
-SIGNIFICANT_PD_LIMIT  = 10.0     # > 10.0 Delta PD indicates significant deviation (referral)
+NORMAL_TOTAL_PD_LIMIT      = 6.0      # <= 6.0 Delta PD total deviation is normal orthophoria / physiological near phoria
+BORDERLINE_PD_LIMIT        = 10.0     # 6.0 - 10.0 Delta PD indicates mild/moderate phoria
+SIGNIFICANT_PD_LIMIT       = 10.0     # > 10.0 Delta PD indicates significant deviation (referral)
+ACT_TROPIA_THRESH_DEG      = 4.5      # ~ 7.9 Delta PD axis-specific refixation threshold (clears webcam hand-occlusion warp)
+VERTICAL_ACT_THRESH_DEG    = 4.5      # ~ 7.9 Delta PD vertical threshold (avoids eyelid/blink twitch)
+MIN_ACT_REFIXATION_PEAK_VEL = 75.0    # deg/s (matched to 30 FPS central-difference velocity)
+MIN_ACT_REFIXATION_LATENCY  = 90.0    # ms (rejects premature < 90 ms hand-entry artifacts)
+
+ACT_DIRECTION_META = {
+    "EXO":   ("Outward",     "Inward corrective movement",     "exophoric"),
+    "ESO":   ("Inward",      "Outward corrective movement",    "esophoric"),
+    "HYPER": ("Upward",      "Downward corrective movement",   "hyperphoric"),
+    "HYPO":  ("Downward",    "Upward corrective movement",     "hypophoric"),
+    "ORTHO": ("Orthophoric", "None (Steady fixation preserved)", "orthophoric"),
+}
 
 
 @dataclass
@@ -154,8 +166,13 @@ class AlternateCoverTestEngine:
         self.mean_os_saccade_pd: float = 0.0
         self.hering_symmetry_ratio: float = 1.0
         self.dominant_direction: str = "NONE"
+        self.dev_direction_label: str = "Orthophoric"
+        self.saccade_direction_label: str = "None (Steady fixation preserved)"
+        self.phoria_type_label: str = "orthophoric"
         self.clinical_diagnosis: str = "INITIALIZING"
         self.diagnostic_details: str = ""
+        self.interp_summary: str = ""
+        self.interp_details: str = ""
         self.report_saved: bool = False
         self.report_paths: Dict[str, str] = {}
 
@@ -196,8 +213,13 @@ class AlternateCoverTestEngine:
         self.mean_os_saccade_pd = 0.0
         self.hering_symmetry_ratio = 1.0
         self.dominant_direction = "NONE"
+        self.dev_direction_label = "Orthophoric"
+        self.saccade_direction_label = "None (Steady fixation preserved)"
+        self.phoria_type_label = "orthophoric"
         self.clinical_diagnosis = "INITIALIZING"
         self.diagnostic_details = ""
+        self.interp_summary = ""
+        self.interp_details = ""
         self.report_saved = False
         self.report_paths.clear()
         print("\n[INFO] Alternate Cover Test Engine reset to POSITIONING.")
@@ -225,6 +247,69 @@ class AlternateCoverTestEngine:
             cycle_num = (self.current_step // 2) + 1
             print(f"\n[ACT TRANSITION] Step {self.current_step + 1}/{TOTAL_TRANSITIONS} (Cycle {cycle_num}/4) -> Target Cover: {self.target_covered_eye}")
 
+    def _validate_act_refixation(
+        self,
+        analyzer: EyeMovementAnalyzer,
+        sac: Optional[SaccadeEvent],
+        trigger_ms: float
+    ) -> Tuple[Optional[SaccadeEvent], str, float]:
+        """
+        Validates an ACT step refixation candidate against latency, speed, axis-specific
+        amplitude, and sustained post-switch fixation shift so blinks and hand-entry
+        FaceMesh artifacts are rejected. Returns (validated_sac, strab_type, axis_amp_deg).
+        """
+        if sac is None:
+            return None, "NONE", 0.0
+
+        if sac.onset_latency_ms is None or sac.onset_latency_ms < MIN_ACT_REFIXATION_LATENCY:
+            return None, "NONE", 0.0
+
+        h_abs = abs(sac.amplitude_h_deg)
+        v_abs = abs(sac.amplitude_v_deg)
+
+        is_vert = (v_abs >= VERTICAL_ACT_THRESH_DEG) and (v_abs > h_abs) and (
+            sac.strabismus_sign in ("HYPERTROPIA", "HYPOTROPIA")
+        )
+        is_horiz = (h_abs >= ACT_TROPIA_THRESH_DEG) and (
+            h_abs >= v_abs or sac.strabismus_sign in ("ESOTROPIA", "EXOTROPIA")
+        )
+        if not (is_horiz or is_vert):
+            return None, "NONE", 0.0
+
+        if sac.peak_velocity_deg_s < MIN_ACT_REFIXATION_PEAK_VEL:
+            return None, "NONE", 0.0
+
+        # Sustained fixation shift check: Step 1 has uncovered pre-trigger frames,
+        # while Steps 2-8 compare initial post-uncover samples vs settled post-saccade hold.
+        t_arr = np.array(analyzer.timestamps)
+        val_arr = np.array(analyzer.is_valid)
+        arr = np.array(analyzer.yaw_deg if is_horiz else analyzer.pitch_deg)
+        pre_mask = val_arr & (t_arr >= trigger_ms - 800.0) & (t_arr <= trigger_ms - 100.0)
+        if np.sum(pre_mask) < 5:
+            pre_mask = val_arr & (t_arr >= trigger_ms) & (t_arr <= sac.start_time_ms)
+        post_mask = val_arr & (t_arr >= sac.end_time_ms + 100.0) & (t_arr <= sac.end_time_ms + 1200.0)
+
+        axis_amp = h_abs if is_horiz else v_abs
+        if np.sum(pre_mask) >= 1 and np.sum(post_mask) >= 5:
+            pre_ref = float(np.median(arr[pre_mask]))
+            post_med = float(np.median(arr[post_mask]))
+            net_shift = abs(post_med - pre_ref)
+            if net_shift < 0.6 * axis_amp:
+                return None, "NONE", 0.0
+            spike_mask = val_arr & (t_arr >= sac.start_time_ms) & (t_arr <= sac.end_time_ms + 60.0)
+            if np.any(spike_mask):
+                peak_exc = float(np.max(np.abs(arr[spike_mask] - pre_ref)))
+                if peak_exc > 1.75 * max(net_shift, 1.0):
+                    return None, "NONE", 0.0
+
+        if is_vert:
+            strab_type = "HYPER" if sac.direction_v == "DOWNWARD" else "HYPO"
+        else:
+            strab_type = "EXO" if sac.direction_h == "NASAL" else ("ESO" if sac.direction_h == "TEMPORAL" else "NONE")
+        if strab_type == "NONE":
+            return None, "NONE", 0.0
+        return sac, strab_type, axis_amp
+
     def _on_step_completed(self, step_idx: int):
         """Processes the refixation saccade on the observed fellow eye."""
         covered = self.target_covered_eye
@@ -233,20 +318,22 @@ class AlternateCoverTestEngine:
         cycle = (step_idx // 2) + 1
         
         saccade: Optional[SaccadeEvent] = None
+        strab_type = "NONE"
+        axis_amp = 0.0
         if self.trigger_time_ms is not None:
-            saccade = analyzer.extract_refixation_saccade(
+            raw_sac = analyzer.extract_refixation_saccade(
                 trigger_ms=self.trigger_time_ms,
                 post_trigger_window_ms=700.0,
                 tested_eye=observed
             )
+            saccade, strab_type, axis_amp = self._validate_act_refixation(
+                analyzer, raw_sac, self.trigger_time_ms
+            )
             
-        if saccade and saccade.amplitude_deg >= 1.5:
-            amp_deg = saccade.amplitude_deg
-            amp_pd = saccade.amplitude_pd
-            direction = saccade.direction_h
-            # Inward refixation jump (Nasal) means eye was resting outward (Exo)
-            # Outward refixation jump (Temporal) means eye was resting inward (Eso)
-            strab_type = "EXO" if direction == "NASAL" else ("ESO" if direction == "TEMPORAL" else "NONE")
+        if saccade and axis_amp > 0.0:
+            amp_deg = axis_amp
+            amp_pd = axis_amp * PD_PER_DEGREE
+            direction = saccade.direction_h if strab_type in ("EXO", "ESO") else saccade.direction_v
             peak_v = saccade.peak_velocity_deg_s
             lat = saccade.onset_latency_ms
             is_valid = True
@@ -435,13 +522,32 @@ class AlternateCoverTestEngine:
             return
 
         # 1. Total Dissociated Deviation Statistics
-        all_amps_pd = [t.amplitude_pd for t in valid_transitions]
-        od_transitions = [t for t in valid_transitions if t.observed_eye == "OD"]
-        os_transitions = [t for t in valid_transitions if t.observed_eye == "OS"]
-        
+        # Directional consistency check: count horizontal/vertical refixations by type
+        vote_counts = {
+            t_type: sum(1 for t in valid_transitions if t.strabismus_type == t_type)
+            for t_type in ("EXO", "ESO", "HYPER", "HYPO")
+        }
+        horiz_net = abs(vote_counts["EXO"] - vote_counts["ESO"])
+        vert_net = abs(vote_counts["HYPER"] - vote_counts["HYPO"])
+
+        dominant = "ORTHO"
+        if horiz_net >= 2 and max(vote_counts["EXO"], vote_counts["ESO"]) >= max(vote_counts["HYPER"], vote_counts["HYPO"]):
+            dominant = "EXO" if vote_counts["EXO"] > vote_counts["ESO"] else "ESO"
+        elif vert_net >= 2:
+            dominant = "HYPER" if vote_counts["HYPER"] > vote_counts["HYPO"] else "HYPO"
+
+        self.dominant_direction = dominant
+        self.dev_direction_label, self.saccade_direction_label, self.phoria_type_label = ACT_DIRECTION_META[dominant]
+
+        # Score deviation over transitions consistent with the dominant refixation pattern (or 0 for ortho)
+        consistent_transitions = [t for t in valid_transitions if t.strabismus_type == dominant] if dominant != "ORTHO" else []
+        all_amps_pd = [t.amplitude_pd if t.strabismus_type == dominant else 0.0 for t in valid_transitions] if dominant != "ORTHO" else [0.0]
+        od_transitions = [t for t in valid_transitions if t.observed_eye == "OD" and t.strabismus_type == dominant]
+        os_transitions = [t for t in valid_transitions if t.observed_eye == "OS" and t.strabismus_type == dominant]
+
         self.mean_total_deviation_pd = float(np.mean(all_amps_pd)) if all_amps_pd else 0.0
-        self.std_total_deviation_pd  = float(np.std(all_amps_pd)) if all_amps_pd else 0.0
-        
+        self.std_total_deviation_pd  = float(np.std(all_amps_pd)) if len(all_amps_pd) > 1 else 0.0
+
         self.mean_od_saccade_pd = float(np.mean([t.amplitude_pd for t in od_transitions])) if od_transitions else 0.0
         self.mean_os_saccade_pd = float(np.mean([t.amplitude_pd for t in os_transitions])) if os_transitions else 0.0
 
@@ -450,7 +556,7 @@ class AlternateCoverTestEngine:
             v_diff = np.abs(np.array(self.log_od_pitch[-60:]) - np.array(self.log_os_pitch[-60:]))
             self.mean_vertical_deviation_pd = float(np.mean(v_diff) * PD_PER_DEGREE)
         else:
-            self.mean_vertical_deviation_pd = 1.0
+            self.mean_vertical_deviation_pd = 0.0
 
         # Hering's law symmetry ratio (ideal ~ 1.0)
         if max(self.mean_od_saccade_pd, self.mean_os_saccade_pd) > 1.0:
@@ -461,28 +567,8 @@ class AlternateCoverTestEngine:
         else:
             self.hering_symmetry_ratio = 1.0
 
-        # Dominant Strabismus Type & Direction
-        exo_votes = sum(1 for t in valid_transitions if t.strabismus_type == "EXO")
-        eso_votes = sum(1 for t in valid_transitions if t.strabismus_type == "ESO")
-        
-        if exo_votes > eso_votes and exo_votes >= 2:
-            self.dominant_direction = "EXO"
-            self.dev_direction_label = "Outward"
-            self.saccade_direction_label = "Inward corrective movement"
-            self.phoria_type_label = "exophoric"
-        elif eso_votes > exo_votes and eso_votes >= 2:
-            self.dominant_direction = "ESO"
-            self.dev_direction_label = "Inward"
-            self.saccade_direction_label = "Outward corrective movement"
-            self.phoria_type_label = "esophoric"
-        else:
-            self.dominant_direction = "ORTHO"
-            self.dev_direction_label = "Orthophoric"
-            self.saccade_direction_label = "None (Steady fixation preserved)"
-            self.phoria_type_label = "orthophoric"
-
-        # Saccade kinematics across transitions
-        saccade_records = [t for t in valid_transitions if t.amplitude_deg > 0.5]
+        # Saccade kinematics across consistent refixation transitions
+        saccade_records = [t for t in consistent_transitions if t.amplitude_deg > 0.5]
         if saccade_records:
             self.avg_saccade_latency = float(np.mean([t.latency_ms for t in saccade_records]))
             self.avg_saccade_amplitude_deg = float(np.mean([t.amplitude_deg for t in saccade_records]))
@@ -503,24 +589,27 @@ class AlternateCoverTestEngine:
             self.avg_fps = 30.0
 
         # Clinical Diagnosis Classification:
-        if self.mean_total_deviation_pd <= NORMAL_TOTAL_PD_LIMIT:
+        if dominant == "ORTHO" or self.mean_total_deviation_pd <= NORMAL_TOTAL_PD_LIMIT:
             self.clinical_diagnosis = "ORTHOPHORIA (NORMAL)"
-            self.diagnostic_details = (
-                f"Normal total dissociated deviation ({self.mean_total_deviation_pd:.1f} \u0394PD). "
-                "No significant refixation saccades observed upon alternating occlusion. Robust binocular stability."
-            )
+            self.interp_summary = "No consistent dissociated refixation saccades observed during alternate occlusion."
+            self.interp_details = "Both eyes maintained steady central fixation without manifest or significant latent deviation."
+            self.diagnostic_details = f"{self.interp_summary} {self.interp_details}"
         elif self.mean_total_deviation_pd <= BORDERLINE_PD_LIMIT:
             self.clinical_diagnosis = f"MILD TOTAL {self.dev_direction_label.upper()} DEVIATION"
+            self.interp_summary = f"Estimated {self.dev_direction_label.lower()} deviation observed during alternate occlusion."
+            self.interp_details = f"Pattern suggests a possible {self.phoria_type_label} deviation if binocular alignment was maintained during the baseline test."
             self.diagnostic_details = (
-                f"Estimated {self.dev_direction_label.lower()} deviation observed during alternate occlusion.\n\n"
-                f"Pattern suggests a possible {self.phoria_type_label} deviation if binocular alignment was maintained during the baseline test.\n\n"
+                f"{self.interp_summary}\n\n"
+                f"{self.interp_details}\n\n"
                 "Recommendation: Compare with Cover-Uncover findings and confirm clinically using an appropriate prism measurement."
             )
         else:
             self.clinical_diagnosis = f"SIGNIFICANT TOTAL {self.dev_direction_label.upper()} DEVIATION"
+            self.interp_summary = f"Significant {self.dev_direction_label.lower()} deviation ({self.mean_total_deviation_pd:.1f} \u0394PD) observed during alternate occlusion."
+            self.interp_details = f"Pattern confirms a large {self.phoria_type_label} component requiring clinical follow-up."
             self.diagnostic_details = (
-                f"Significant {self.dev_direction_label.lower()} deviation ({self.mean_total_deviation_pd:.1f} \u0394PD) observed during alternate occlusion.\n\n"
-                f"Pattern confirms a large {self.phoria_type_label} component requiring clinical follow-up.\n\n"
+                f"{self.interp_summary}\n\n"
+                f"{self.interp_details}\n\n"
                 "Recommendation: Compare with Cover-Uncover findings and confirm clinically using an appropriate prism measurement."
             )
 
@@ -583,9 +672,9 @@ class AlternateCoverTestEngine:
             "",
             "5. Interpretation",
             "Illustrative interpretation",
-            f"Estimated {self.dev_direction_label.lower()} deviation observed during alternate occlusion.",
+            self.interp_summary or f"Estimated {self.dev_direction_label.lower()} deviation observed during alternate occlusion.",
             "",
-            f"Pattern suggests a possible {self.phoria_type_label} deviation if binocular alignment was maintained during the baseline test.",
+            self.interp_details or f"Pattern suggests a possible {self.phoria_type_label} deviation if binocular alignment was maintained during the baseline test.",
             "",
             "Recommendation: Compare with Cover-Uncover findings and confirm clinically using an appropriate prism measurement",
             "================================================================================"
@@ -634,8 +723,8 @@ class AlternateCoverTestEngine:
                 "cover_detection": "Successful"
             },
             "interpretation": {
-                "summary": f"Estimated {self.dev_direction_label.lower()} deviation observed during alternate occlusion.",
-                "details": f"Pattern suggests a possible {self.phoria_type_label} deviation if binocular alignment was maintained during the baseline test.",
+                "summary": self.interp_summary or f"Estimated {self.dev_direction_label.lower()} deviation observed during alternate occlusion.",
+                "details": self.interp_details or f"Pattern suggests a possible {self.phoria_type_label} deviation if binocular alignment was maintained during the baseline test.",
                 "recommendation": "Compare with Cover-Uncover findings and confirm clinically using an appropriate prism measurement."
             },
             "transitions": [asdict(t) for t in self.transitions],
@@ -775,7 +864,7 @@ def draw_act_hud(canvas: np.ndarray, engine: AlternateCoverTestEngine, tracker: 
             canvas[pip_y:pip_y + pip_h, pos_x:pos_x + pip_w] = pip_os
             border_c = (0, 0, 255) if result.eye_covered == "OS" else (0, 220, 0)
             cv2.rectangle(canvas, (pos_x, pip_y), (pos_x + pip_w, pip_y + pip_h), border_c, 2)
-            cv2.putText(canvas, f"OS: {result.os_angle[0]:+.1f}\u00b0", (pos_x + 6, pip_y + pip_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
+            cv2.putText(canvas, f"OS: {result.os_angle[0]:+.1f} deg", (pos_x + 6, pip_y + pip_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
 
     # OD PiP (Top-Right)
     od_x1, od_y1, od_x2, od_y2 = map_box(result.od_box)
@@ -787,7 +876,7 @@ def draw_act_hud(canvas: np.ndarray, engine: AlternateCoverTestEngine, tracker: 
             canvas[pip_y:pip_y + pip_h, pos_x:pos_x + pip_w] = pip_od
             border_c = (0, 0, 255) if result.eye_covered == "OD" else (0, 220, 0)
             cv2.rectangle(canvas, (pos_x, pip_y), (pos_x + pip_w, pip_y + pip_h), border_c, 2)
-            cv2.putText(canvas, f"OD: {result.od_angle[0]:+.1f}\u00b0", (pos_x + 6, pip_y + pip_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
+            cv2.putText(canvas, f"OD: {result.od_angle[0]:+.1f} deg", (pos_x + 6, pip_y + pip_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
 
     # --------------------------------------------------------------------------
     # 3. STEP PROGRESSION BAR FOR 8 ALTERNATING TRANSITIONS
@@ -921,7 +1010,7 @@ def draw_act_hud(canvas: np.ndarray, engine: AlternateCoverTestEngine, tracker: 
         cv2.putText(canvas, dev_txt2, (rx + 35, ry + 165), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (210, 210, 210), 1)
 
         # 3. Saccade Measurements
-        sacc_txt1 = f"Avg Latency: {engine.avg_saccade_latency:.0f} ms | Amplitude: {engine.avg_saccade_amplitude_deg:.1f}\u00b0 | Peak: {engine.peak_saccade_velocity:.0f}\u00b0/s"
+        sacc_txt1 = f"Avg Latency: {engine.avg_saccade_latency:.0f} ms | Amplitude: {engine.avg_saccade_amplitude_deg:.1f} deg | Peak: {engine.peak_saccade_velocity:.0f} deg/s"
         sacc_txt2 = f"Direction: {engine.saccade_direction_label}"
         cv2.putText(canvas, "3. SACCADE MEASUREMENTS", (rx + 25, ry + 190), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 200, 255), 1)
         cv2.putText(canvas, sacc_txt1, (rx + 35, ry + 210), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (210, 210, 210), 1)
@@ -934,8 +1023,8 @@ def draw_act_hud(canvas: np.ndarray, engine: AlternateCoverTestEngine, tracker: 
 
         # 5. Interpretation
         cv2.putText(canvas, "5. INTERPRETATION", (rx + 25, ry + 300), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 200, 255), 1)
-        interp_txt1 = f"Estimated {engine.dev_direction_label.lower()} deviation observed during alternate occlusion."
-        interp_txt2 = f"Pattern suggests a possible {engine.phoria_type_label} deviation if binocular baseline was aligned."
+        interp_txt1 = engine.interp_summary or f"Estimated {engine.dev_direction_label.lower()} deviation observed during alternate occlusion."
+        interp_txt2 = engine.interp_details or f"Pattern suggests a possible {engine.phoria_type_label} deviation if binocular baseline was aligned."
         cv2.putText(canvas, interp_txt1, (rx + 35, ry + 320), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1)
         cv2.putText(canvas, interp_txt2, (rx + 35, ry + 338), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 220, 255), 1)
 

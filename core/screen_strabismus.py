@@ -94,17 +94,17 @@ CARDINAL_TARGETS: List[CardinalTargetDef] = [
     # 1. Primary Position (Center) - Tested first as baseline reference
     CardinalTargetDef(1, "Primary Position (Center)", 1, 1, 0.50, 0.50, "CENTER", "Baseline Parallel Alignment", 2.0),
     
-    # 2-5. Four Cardinal Versional Directions
-    CardinalTargetDef(2, "Dextroversion (Right)", 1, 2, 0.85, 0.50, "R", "OD: Lateral Rectus | OS: Medial Rectus", 1.5),
-    CardinalTargetDef(3, "Levoversion (Left)", 1, 0, 0.15, 0.50, "L", "OD: Medial Rectus | OS: Lateral Rectus", 1.5),
-    CardinalTargetDef(4, "Sursumversion (Up)", 0, 1, 0.50, 0.15, "U", "Both: Superior Recti & Inferior Obliques", 1.5),
-    CardinalTargetDef(5, "Deorsumversion (Down)", 2, 1, 0.50, 0.85, "D", "Both: Inferior Recti & Superior Obliques", 1.5),
+    # 2-5. Four Cardinal Versional Directions (0.22..0.78 keeps safe angular span even when maximized)
+    CardinalTargetDef(2, "Dextroversion (Right)", 1, 2, 0.78, 0.50, "R", "OD: Lateral Rectus | OS: Medial Rectus", 1.5),
+    CardinalTargetDef(3, "Levoversion (Left)", 1, 0, 0.22, 0.50, "L", "OD: Medial Rectus | OS: Lateral Rectus", 1.5),
+    CardinalTargetDef(4, "Sursumversion (Up)", 0, 1, 0.50, 0.20, "U", "Both: Superior Recti & Inferior Obliques", 1.5),
+    CardinalTargetDef(5, "Deorsumversion (Down)", 2, 1, 0.50, 0.78, "D", "Both: Inferior Recti & Superior Obliques", 1.5),
     
     # 6-9. Four Oblique Diagnostic Versional Directions
-    CardinalTargetDef(6, "Dextroelevation (Up-Right)", 0, 2, 0.85, 0.15, "UR", "OD: Superior Rectus | OS: Inferior Oblique", 1.5),
-    CardinalTargetDef(7, "Levoelevation (Up-Left)", 0, 0, 0.15, 0.15, "UL", "OD: Inferior Oblique | OS: Superior Rectus", 1.5),
-    CardinalTargetDef(8, "Dextrodepression (Down-Right)", 2, 2, 0.85, 0.85, "DR", "OD: Inferior Rectus | OS: Superior Oblique", 1.5),
-    CardinalTargetDef(9, "Levodepression (Down-Left)", 2, 0, 0.15, 0.85, "DL", "OD: Superior Oblique | OS: Inferior Rectus", 1.5),
+    CardinalTargetDef(6, "Dextroelevation (Up-Right)", 0, 2, 0.78, 0.20, "UR", "OD: Superior Rectus | OS: Inferior Oblique", 1.5),
+    CardinalTargetDef(7, "Levoelevation (Up-Left)", 0, 0, 0.22, 0.20, "UL", "OD: Inferior Oblique | OS: Superior Rectus", 1.5),
+    CardinalTargetDef(8, "Dextrodepression (Down-Right)", 2, 2, 0.78, 0.78, "DR", "OD: Inferior Rectus | OS: Superior Oblique", 1.5),
+    CardinalTargetDef(9, "Levodepression (Down-Left)", 2, 0, 0.22, 0.78, "DL", "OD: Superior Oblique | OS: Inferior Rectus", 1.5),
 ]
 
 @dataclass
