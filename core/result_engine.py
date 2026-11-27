@@ -235,12 +235,16 @@ class ResultEngine:
             conf_penalties += 20
 
         # Apply Noise-Floor Guardrail
-        # If all readings are below the physical webcam noise floor, enforce Orthophoria
+        # When both dynamic cover tests confirm zero manifest tropia and zero dissociated phoria,
+        # a uniform static primary disparity reflects physiological Angle Kappa rather than squint.
+        has_both_cover_tests = (cover_test_data is not None) and (act_data is not None)
         is_below_noise_floor = (
-            abs(primary_h_pd) < self.noise_floor_pd and
+            (has_both_cover_tests or abs(primary_h_pd) < self.noise_floor_pd) and
             manifest_pd < self.noise_floor_pd and
             total_act_pd < (self.noise_floor_pd + 1.5)
         )
+        if has_both_cover_tests and abs(primary_h_pd) >= self.noise_floor_pd and is_below_noise_floor:
+            flags.append("PHYSIOLOGICAL_ANGLE_KAPPA_OFFSET")
 
         # ----------------------------------------------------------------------
         # 5. THREE-TIER TRIAGE DECISION LOGIC
@@ -275,7 +279,13 @@ class ResultEngine:
 
         elif is_below_noise_floor and comitancy_status == "COMITANT" and latent_phoria_pd < 4.0:
             triage_level = TriageLevel.NORMAL
-            summary_desc = "Normal ocular alignment and parallel binocular coordination preserved across all tested protocols."
+            if abs(primary_h_pd) >= self.noise_floor_pd and has_both_cover_tests:
+                summary_desc = (
+                    f"Normal dynamic alignment on Cover-Uncover and ACT (static {primary_h_pd:+.1f} \u0394PD offset "
+                    "consistent with physiological Angle Kappa)."
+                )
+            else:
+                summary_desc = "Normal ocular alignment and parallel binocular coordination preserved across all tested protocols."
             recom = "Annual visual screening recommended. No clinical signs of strabismus detected."
             
         else:

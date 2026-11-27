@@ -35,8 +35,23 @@ debug_eye_patch.png
 *.png
 *.jpg
 *.jpeg
+!report/figures/*.png
+!report/figures/*.jpg
 *.log
 scratch/
+
+# LaTeX build artifacts
+*.aux
+*.out
+*.toc
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# MS Office temporary lock files
+~$*
 
 # OS & Environment
 .DS_Store
