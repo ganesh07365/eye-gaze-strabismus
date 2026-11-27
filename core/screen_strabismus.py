@@ -137,6 +137,7 @@ class CardinalGazeEngine:
         self.target_idx = 0
         self.target_state = TargetState.ACQUIRING
         self.aim_settled_frames = 0
+        self.drift_grace_frames = 0
         self.transition_pause_timer = 0.0
         
         self.phase_start_time = time.time()
@@ -153,6 +154,18 @@ class CardinalGazeEngine:
         self.curr_delta_h: List[float] = []
         self.curr_delta_v: List[float] = []
         
+        # Positioning baseline buffers (auto-calibrates laptop tilt & personal eye-corner offset)
+        self.pos_versional_h: List[float] = []
+        self.pos_versional_v: List[float] = []
+        self.pos_eff_h: List[float] = []
+        self.pos_eff_v: List[float] = []
+        self.pos_norm_sx: List[float] = []
+        self.pos_norm_sy: List[float] = []
+        self.curr_eff_h: List[float] = []
+        self.curr_eff_v: List[float] = []
+        self.curr_norm_sx: List[float] = []
+        self.curr_norm_sy: List[float] = []
+        
         # Final recorded measurements across all 9 positions
         self.position_results: Dict[int, PositionMeasurement] = {}
         
@@ -162,10 +175,14 @@ class CardinalGazeEngine:
         self.log_os_yaw: List[float] = []
         self.log_delta_pd_h: List[float] = []
         
-        # Comitancy synthesis
+        # Comitancy synthesis & personalized resting gaze baseline
         self.primary_delta_pd: Tuple[float, float] = (0.0, 0.0)
         self.baseline_pitch: Optional[float] = None
         self.baseline_yaw: Optional[float] = None
+        self.baseline_eff_h: Optional[float] = None
+        self.baseline_eff_v: Optional[float] = None
+        self.baseline_norm_sx: Optional[float] = None
+        self.baseline_norm_sy: Optional[float] = None
         self.max_deviation_pd: float = 0.0
         self.min_deviation_pd: float = 0.0
         self.max_dev_pos_name: str = ""
@@ -186,6 +203,7 @@ class CardinalGazeEngine:
         self.target_idx = 0
         self.target_state = TargetState.ACQUIRING
         self.aim_settled_frames = 0
+        self.drift_grace_frames = 0
         self.transition_pause_timer = 0.0
         
         self.phase_start_time = time.time()
@@ -195,6 +213,12 @@ class CardinalGazeEngine:
         self.compliance_msg = ""
         
         self._clear_current_buffers()
+        self.pos_versional_h.clear()
+        self.pos_versional_v.clear()
+        self.pos_eff_h.clear()
+        self.pos_eff_v.clear()
+        self.pos_norm_sx.clear()
+        self.pos_norm_sy.clear()
         self.position_results.clear()
         self.log_timestamps.clear()
         self.log_od_yaw.clear()
@@ -204,6 +228,10 @@ class CardinalGazeEngine:
         self.primary_delta_pd = (0.0, 0.0)
         self.baseline_pitch = None
         self.baseline_yaw = None
+        self.baseline_eff_h = None
+        self.baseline_eff_v = None
+        self.baseline_norm_sx = None
+        self.baseline_norm_sy = None
         self.max_deviation_pd = 0.0
         self.min_deviation_pd = 0.0
         self.max_dev_pos_name = ""
@@ -225,6 +253,10 @@ class CardinalGazeEngine:
         self.curr_os_pitch.clear()
         self.curr_delta_h.clear()
         self.curr_delta_v.clear()
+        self.curr_eff_h.clear()
+        self.curr_eff_v.clear()
+        self.curr_norm_sx.clear()
+        self.curr_norm_sy.clear()
 
     def advance_target(self):
         """Saves current target metrics and moves to next cardinal position."""
@@ -273,13 +305,19 @@ class CardinalGazeEngine:
         self.position_results[target_def.target_id] = meas
         if target_def.target_id == 1 and is_valid:
             self.baseline_pitch = 0.5 * (m_od_p + m_os_p)
-            self.baseline_yaw = 0.5 * (m_os_y - m_od_y)
+            self.baseline_yaw = 0.5 * (m_os_y - m_od_y) * 2.0  # Matches versional_h = os_y - od_y
+            if self.curr_eff_h:
+                self.baseline_eff_h = float(np.median(self.curr_eff_h))
+                self.baseline_eff_v = float(np.median(self.curr_eff_v))
+                self.baseline_norm_sx = float(np.median(self.curr_norm_sx))
+                self.baseline_norm_sy = float(np.median(self.curr_norm_sy))
             print(f"  [BASELINE LOCKED] Primary Gaze locked -> Pitch: {self.baseline_pitch:+.2f}\u00b0, Yaw: {self.baseline_yaw:+.2f}\u00b0")
         print(f"  [LOCKED {target_def.target_id}/9] {target_def.name:28s} -> Delta H={m_dh:+5.1f} PD, V={m_dv:+4.1f} PD (BCEA: {bcea:.3f} deg\u00b2)")
 
         self._clear_current_buffers()
         self.dwell_time_accumulated = 0.0
         self.aim_settled_frames = 0
+        self.drift_grace_frames = 0
         self.target_state = TargetState.ACQUIRING
         self.transition_pause_timer = 0.35  # Smooth 350ms transition grace window
         
@@ -318,7 +356,7 @@ class CardinalGazeEngine:
         msg = ""
 
         # ----------------------------------------------------------------------
-        # PHASE 1: POSITIONING CHECK
+        # PHASE 1: POSITIONING CHECK (Also calibrates personal resting baseline)
         # ----------------------------------------------------------------------
         if self.phase == CardinalPhase.POSITIONING:
             if not result.face_detected:
@@ -330,16 +368,33 @@ class CardinalGazeEngine:
             else:
                 is_compliant = True
                 msg = "Good positioning! Hold steady to start test..."
+                v_h = result.os_angle[0] - result.od_angle[0]
+                v_v = 0.5 * (result.od_angle[1] + result.os_angle[1])
+                hy, hp, _ = result.head_pose
+                self.pos_versional_h.append(v_h)
+                self.pos_versional_v.append(v_v)
+                self.pos_eff_h.append(v_h + hy * 0.35)
+                self.pos_eff_v.append(v_v + hp * 0.35)
+                self.pos_norm_sx.append(result.screen_xy[0] / 1920.0)
+                self.pos_norm_sy.append(result.screen_xy[1] / 1080.0)
                 
             self.is_compliant_now = is_compliant
             self.compliance_msg = msg
             if is_compliant:
                 self.dwell_time_accumulated += dt
                 if self.dwell_time_accumulated >= 1.2:
+                    if len(self.pos_versional_h) >= 5:
+                        self.baseline_yaw = float(np.median(self.pos_versional_h))
+                        self.baseline_pitch = float(np.median(self.pos_versional_v))
+                        self.baseline_eff_h = float(np.median(self.pos_eff_h))
+                        self.baseline_eff_v = float(np.median(self.pos_eff_v))
+                        self.baseline_norm_sx = float(np.median(self.pos_norm_sx))
+                        self.baseline_norm_sy = float(np.median(self.pos_norm_sy))
                     self.phase = CardinalPhase.TESTING
                     self.target_idx = 0
                     self.target_state = TargetState.ACQUIRING
                     self.aim_settled_frames = 0
+                    self.drift_grace_frames = 0
                     self.dwell_time_accumulated = 0.0
                     self.transition_pause_timer = 0.35  # Grace pause when test starts
                     print("\n[PHASE ADVANCE] POSITIONING -> TESTING TARGET 1/9")
@@ -393,77 +448,97 @@ class CardinalGazeEngine:
                 norm_sx = result.screen_xy[0] / 1920.0
                 norm_sy = result.screen_xy[1] / 1080.0
                 
-                # Relative delta from Target 1 baseline (if available)
-                delta_v_base = (versional_v - self.baseline_pitch) if self.baseline_pitch is not None else 0.0
-                delta_h_base = (versional_h - self.baseline_yaw) if self.baseline_yaw is not None else 0.0
+                # Relative shifts from calibrated resting baseline (auto-compensates for camera tilt & anatomy)
+                has_base = (self.baseline_pitch is not None and self.baseline_yaw is not None)
+                base_v = self.baseline_pitch if self.baseline_pitch is not None else 0.0
+                base_h = self.baseline_yaw if self.baseline_yaw is not None else 0.0
+                base_eh = self.baseline_eff_h if self.baseline_eff_h is not None else 0.0
+                base_ev = self.baseline_eff_v if self.baseline_eff_v is not None else 0.0
+                base_sx = self.baseline_norm_sx if self.baseline_norm_sx is not None else 0.50
+                base_sy = self.baseline_norm_sy if self.baseline_norm_sy is not None else 0.50
+
+                delta_h_base = versional_h - base_h
+                delta_v_base = versional_v - base_v
+                rel_h = effective_h - base_eh
+                rel_v = effective_v - base_ev
+                rel_sx = norm_sx - base_sx
+                rel_sy = norm_sy - base_sy
                 
-                # Horizontal and vertical gaze components with multi-cue redundancy
+                # Horizontal and vertical gaze components relative to personal center
                 is_looking_right = (
-                    effective_h > 1.8
-                    or result.os_angle[0] > 1.0
-                    or result.od_angle[0] < -1.0
-                    or norm_sx > 0.52
+                    rel_h > 1.5
                     or delta_h_base > 1.2
+                    or rel_sx > 0.02
+                    or (not has_base and effective_h > 1.8)
                 )
                 is_looking_left = (
-                    effective_h < -1.8
-                    or result.os_angle[0] < -1.0
-                    or result.od_angle[0] > 1.0
-                    or norm_sx < 0.48
+                    rel_h < -1.5
                     or delta_h_base < -1.2
+                    or rel_sx < -0.02
+                    or (not has_base and effective_h < -1.8)
                 )
                 
                 # Downward gaze detection:
-                # In downward gaze, upper eyelids descend naturally and compress detected iris excursion.
-                # Multi-cue check: relative baseline drop, absolute pitch, head pitch, or screen Y coordinate.
+                # Relative drop from personal baseline handles tilted screens and descended eyelids
                 is_looking_down = (
-                    effective_v > 0.6
-                    or delta_v_base > 0.4
-                    or result.od_angle[1] > 0.6
-                    or result.os_angle[1] > 0.6
-                    or norm_sy > 0.51
-                    or head_pitch > 5.0
+                    rel_v > 0.12
+                    or delta_v_base > 0.10
+                    or rel_sy > 0.004
+                    or head_pitch > 4.0
+                    or (not has_base and effective_v > 0.6)
                 )
                 
                 is_looking_up = (
-                    effective_v < -1.0
-                    or delta_v_base < -0.4
-                    or result.od_angle[1] < -0.8
-                    or result.os_angle[1] < -0.8
-                    or norm_sy < 0.49
-                    or head_pitch < -5.0
+                    rel_v < -0.25
+                    or delta_v_base < -0.20
+                    or rel_sy < -0.006
+                    or head_pitch < -4.0
+                    or (not has_base and effective_v < -1.0)
                 )
                 
                 is_looking_center = (
-                    abs(effective_h) < 6.5
-                    and abs(versional_v - (self.baseline_pitch or 0.0)) < 6.5
+                    abs(rel_h) < 10.0
+                    and abs(rel_v) < 10.0
+                    and abs(head_yaw) < 18.0
+                    and abs(head_pitch) < 18.0
                 )
 
                 quadrant = target_def.expected_quadrant
                 direction_ok = False
+                hold_ok = False
                 
                 if quadrant == "CENTER":
                     direction_ok = is_looking_center
+                    hold_ok = is_looking_center
                 elif quadrant == "R":
                     direction_ok = is_looking_right
+                    hold_ok = is_looking_right or rel_h > 0.4 or delta_h_base > 0.3
                 elif quadrant == "L":
                     direction_ok = is_looking_left
+                    hold_ok = is_looking_left or rel_h < -0.4 or delta_h_base < -0.3
                 elif quadrant == "U":
                     direction_ok = is_looking_up
+                    hold_ok = is_looking_up or rel_v < 0.2 or head_pitch < -3.0
                 elif quadrant == "D":
                     direction_ok = is_looking_down
+                    hold_ok = is_looking_down or rel_v > -0.15 or head_pitch > 3.0
                 elif quadrant == "UR":
-                    direction_ok = (is_looking_right and is_looking_up) or (effective_h > 1.2 and effective_v < -0.6)
+                    direction_ok = (is_looking_right and is_looking_up) or (rel_h > 1.2 and rel_v < -0.15)
+                    hold_ok = (rel_h > 0.5 or delta_h_base > 0.4) and (rel_v < 0.8)
                 elif quadrant == "UL":
-                    direction_ok = (is_looking_left and is_looking_up) or (effective_h < -1.2 and effective_v < -0.6)
+                    direction_ok = (is_looking_left and is_looking_up) or (rel_h < -1.2 and rel_v < -0.15)
+                    hold_ok = (rel_h < -0.5 or delta_h_base < -0.4) and (rel_v < 0.8)
                 elif quadrant == "DR":
-                    direction_ok = (is_looking_right and is_looking_down) or (effective_h > 1.0 and is_looking_down) or (norm_sx > 0.52 and is_looking_down)
+                    direction_ok = (is_looking_right and is_looking_down) or (rel_h > 1.0 and rel_v > 0.08)
+                    hold_ok = (rel_h > 0.5 or delta_h_base > 0.4) and (rel_v > -0.8)
                 elif quadrant == "DL":
-                    direction_ok = (is_looking_left and is_looking_down) or (effective_h < -1.0 and is_looking_down) or (norm_sx < 0.48 and is_looking_down)
+                    direction_ok = (is_looking_left and is_looking_down) or (rel_h < -1.0 and rel_v > 0.08)
+                    hold_ok = (rel_h < -0.5 or delta_h_base < -0.4) and (rel_v > -0.8)
 
                 # STAGE 1: ACQUIRING (Aiming at target - Timer is PAUSED at 0.0s)
                 if self.target_state == TargetState.ACQUIRING:
                     self.dwell_time_accumulated = 0.0
+                    self.drift_grace_frames = 0
                     self.is_compliant_now = False
                     
                     if direction_ok:
@@ -473,6 +548,7 @@ class CardinalGazeEngine:
                         if self.aim_settled_frames >= 3:
                             self.target_state = TargetState.LOCKED_HOLD
                             self.dwell_time_accumulated = 0.0
+                            self.drift_grace_frames = 0
                             self._clear_current_buffers()
                             msg = f"LOCK ENGAGED! Hold steady on {target_def.name}..."
                     else:
@@ -481,29 +557,43 @@ class CardinalGazeEngine:
 
                 # STAGE 2: LOCKED_HOLD (Recording data - Full countdown from 0% to 100%)
                 elif self.target_state == TargetState.LOCKED_HOLD:
-                    if direction_ok:
+                    if hold_ok:
+                        self.drift_grace_frames = 0
                         is_compliant = True
                         self.dwell_time_accumulated += dt
                         rem = max(0.0, req_hold - self.dwell_time_accumulated)
                         pct = int(min(1.0, self.dwell_time_accumulated / req_hold) * 100)
                         msg = f"Fixation locked! Hold steady on {target_def.name}... {pct}% ({rem:.1f}s)"
                         
-                        # Accumulate pure settled fixation data
-                        self.curr_od_yaw.append(result.od_angle[0])
-                        self.curr_od_pitch.append(result.od_angle[1])
-                        self.curr_os_yaw.append(result.os_angle[0])
-                        self.curr_os_pitch.append(result.os_angle[1])
-                        self.curr_delta_h.append(result.delta_pd[0])
-                        self.curr_delta_v.append(result.delta_pd[1])
+                        # Skip initial 0.25s saccade-landing frames and partial blinks for clean BCEA/PD
+                        if self.dwell_time_accumulated >= 0.25 and not result.is_blink_od and not result.is_blink_os:
+                            self.curr_od_yaw.append(result.od_angle[0])
+                            self.curr_od_pitch.append(result.od_angle[1])
+                            self.curr_os_yaw.append(result.os_angle[0])
+                            self.curr_os_pitch.append(result.os_angle[1])
+                            self.curr_delta_h.append(result.delta_pd[0])
+                            self.curr_delta_v.append(result.delta_pd[1])
+                            self.curr_eff_h.append(effective_h)
+                            self.curr_eff_v.append(effective_v)
+                            self.curr_norm_sx.append(norm_sx)
+                            self.curr_norm_sy.append(norm_sy)
                         
                         if self.dwell_time_accumulated >= req_hold:
                             self.advance_target()
                     else:
-                        is_compliant = False
-                        rem = max(0.0, req_hold - self.dwell_time_accumulated)
-                        msg = f"Gaze drifted! Look back at {target_def.name} to continue ({rem:.1f}s left)"
-                        # Soft decay if gaze drifts during hold
-                        self.dwell_time_accumulated = max(0.0, self.dwell_time_accumulated - dt * 0.3)
+                        self.drift_grace_frames += 1
+                        if self.drift_grace_frames <= 4:
+                            # Tolerate brief (~130ms) eyelid/blink jitter without interrupting lock
+                            is_compliant = True
+                            rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                            pct = int(min(1.0, self.dwell_time_accumulated / req_hold) * 100)
+                            msg = f"Fixation locked! Hold steady on {target_def.name}... {pct}% ({rem:.1f}s)"
+                        else:
+                            is_compliant = False
+                            rem = max(0.0, req_hold - self.dwell_time_accumulated)
+                            msg = f"Gaze drifted! Look back at {target_def.name} to continue ({rem:.1f}s left)"
+                            # Soft decay if gaze drifts during hold
+                            self.dwell_time_accumulated = max(0.0, self.dwell_time_accumulated - dt * 0.3)
 
             self.is_compliant_now = is_compliant
             self.compliance_msg = msg
@@ -541,8 +631,25 @@ class CardinalGazeEngine:
             if m.delta_pd_h == min_val:
                 self.min_dev_pos_name = m.name
 
-        # Incomitancy Spread (Absolute Range of Misalignment across gaze fields)
-        self.incomitancy_spread_pd = float(abs(max_val - min_val))
+        # Incomitancy Spread across gaze fields:
+        # On 720p webcams, up to 2 extreme corners/directions can exhibit ~2-3 PD perspective/vergence
+        # shift on healthy eyes. Use robust central spread (Q3-Q1 / inner 5 of 9) unless any focal
+        # field deviates >= 8.0 PD from the median (catching single-muscle palsies cleanly).
+        raw_spread = float(abs(max_val - min_val))
+        if len(all_dh) >= 9:
+            sorted_dh = sorted(all_dh)
+            med_dh = float(np.median(sorted_dh))
+            max_dev_from_med = max(abs(x - med_dh) for x in sorted_dh)
+            central_spread = float(abs(sorted_dh[-3] - sorted_dh[2]))
+            self.incomitancy_spread_pd = raw_spread if max_dev_from_med >= 6.5 else central_spread
+        elif len(all_dh) >= 7:
+            sorted_dh = sorted(all_dh)
+            med_dh = float(np.median(sorted_dh))
+            max_dev_from_med = max(abs(x - med_dh) for x in sorted_dh)
+            trimmed_spread = float(abs(sorted_dh[-2] - sorted_dh[1]))
+            self.incomitancy_spread_pd = raw_spread if max_dev_from_med >= 6.5 else trimmed_spread
+        else:
+            self.incomitancy_spread_pd = raw_spread
         
         # Vertical variation
         all_dv = [m.delta_pd_v for m in valid_results]

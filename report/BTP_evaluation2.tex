@@ -133,14 +133,14 @@ Because nasal coordinates point medially for both eyes, conjugate side gaze indu
 \begin{equation}
 \Delta\theta_H = \theta_{\text{OD,yaw}} + \theta_{\text{OS,yaw}}, \qquad \Delta\theta_V = \theta_{\text{OS,pitch}} - \theta_{\text{OD,pitch}}, \qquad \Delta\text{PD} = 1.7455 \times \Delta\theta
 \end{equation}
-where $\Delta\text{PD}_H > 0$ denotes esotropia (inward convergence) and $\Delta\text{PD}_H < 0$ denotes exotropia (outward divergence). Raw signals pass through \texttt{RockSolidFilter}, a 3-frame median filter coupled with an adaptive exponential moving average ($\alpha_{\text{still}} = 0.25$, $\alpha_{\text{move}} = 0.85$ above saccade threshold $0.4^\circ$) and deadband ($0.05^\circ$) to suppress webcam jitter while preserving sharp refixation saccades.
+where $\Delta\text{PD}_H > 0$ denotes esotropia (inward convergence) and $\Delta\text{PD}_H < 0$ denotes exotropia (outward divergence). Both the per-eye angles and the pixel iris width $w_{\text{iris}}$ pass through \texttt{RockSolidFilter}, a 3-frame median filter coupled with an adaptive exponential moving average ($\alpha_{\text{still}} = 0.25$, $\alpha_{\text{move}} = 0.85$ above $0.4^\circ$) and deadband ($0.05^\circ$) to suppress webcam jitter while preserving sharp refixation saccades.
 
 \subsection{Zero-Lag Occlusion Sensing and Condition-Gated Protocols (Layers 2--3)}
-To automate cover testing without manual button presses, each eye crop is evaluated for physiological openness (palpebral aperture $\ge 0.13$, texture $\sigma \ge 8.0$, P90--P10 contrast $\ge 14.0$, mean luminance $\ge 35.0$) alongside hemispheric ROI brightness asymmetry ($|\Delta I_{\text{ROI}}| > 25$). A 3-frame majority vote yields occlusion states (\texttt{NONE}, \texttt{OD}, \texttt{OS}, \texttt{BOTH}) within $\sim 66\text{ ms}$. Built atop this tracker:
+To automate cover testing without manual button presses, each eye crop is evaluated for physiological openness (palpebral aperture $\ge 0.13$, mean luminance $\ge 15.0$, contrast $\ge 6.0$ or $\sigma \ge 4.0$) together with a tight palpebral iris-vs-sclera Michelson contrast check ($\ge 0.16$, drop $\ge 12.0$) and inter-ocular asymmetry comparison so skin-toned hand or finger occlusion is detected reliably even when MediaPipe projects landmarks onto the hand. A 3-frame majority vote yields occlusion states (\texttt{NONE}, \texttt{OD}, \texttt{OS}, \texttt{BOTH}) within $\sim 66\text{ ms}$. Built atop this tracker:
 \begin{itemize}
     \item \textbf{Cover-Uncover Test (\texttt{cover\_test.py}):} A condition-gated state machine advancing only on verified positioning, central bullseye fixation, and fellow-eye occlusion. Our I-VT analyzer ($v \ge 30^\circ/\text{s}$)~\cite{ref5} extracts refixation amplitude, latency, and peak velocity to detect manifest tropia.
     \item \textbf{Alternate Cover Test (\texttt{alternate\_cover\_test.py}):} Enforces 4 alternating occlusion cycles (8 transitions, $2.0\text{ s}$ hold, $600\text{ ms}$ switch grace window) to break binocular fusion and quantify Total Dissociated Deviation ($\text{Tropia} + \text{Phoria}$) and Hering's Law symmetry.
-    \item \textbf{9-Cardinal Gaze Matrix (\texttt{screen\_strabismus.py}):} Measures alignment and Bivariate Contour Ellipse Area (BCEA)~\cite{ref9} across 9 gaze targets, computing Incomitancy Spread ($\max \Delta\text{PD} - \min \Delta\text{PD}$) to distinguish comitant squint ($\le 5.0\,\Delta\text{PD}$) from paretic incomitancy ($> 8.0\,\Delta\text{PD}$).
+    \item \textbf{9-Cardinal Gaze Matrix (\texttt{screen\_strabismus.py}):} Performs automatic per-session resting-gaze calibration during Positioning, measures alignment and Bivariate Contour Ellipse Area (BCEA)~\cite{ref9} across 9 gaze targets, and computes an outlier-trimmed central 5-of-9 Incomitancy Spread (with a $\ge 6.5\,\Delta\text{PD}$ focal palsy guard) to distinguish comitant squint ($\le 5.0\,\Delta\text{PD}$) from paretic incomitancy ($> 8.0\,\Delta\text{PD}$).
     \item \textbf{Triage Engine (\texttt{result\_engine.py}):} Enforces a $3.5\,\Delta\text{PD}$ sensor noise floor, isolates latent phoria ($\max(0, \text{ACT} - \text{Manifest})$), and outputs \texttt{NORMAL}, \texttt{BORDERLINE}, or \texttt{REFER} with confidence scores and clinical flags.
 \end{itemize}
 
@@ -189,10 +189,10 @@ To automate cover testing without manual button presses, each eye crop is evalua
 \toprule
 \textbf{Sample Video} & \textbf{H ($\Delta\text{PD}$)} & \textbf{V ($\Delta\text{PD}$)} & \textbf{Peak Vel.} & \textbf{Valid} & \textbf{Diagnosis} & \textbf{Triage Action} \\
 \midrule
-\texttt{01\_normal.mp4} & 3.17 & 0.50 & $109^\circ/\text{s}$ & 100\% & Orthophoria & \texttt{NORMAL} ($<3.5$ noise floor) \\
-\texttt{02\_esotropia.mp4} & 26.56 & 1.10 & $344^\circ/\text{s}$ & 96\% & Left Esotropia & \texttt{REFER} (Outward jump) \\
-\texttt{03\_exotropia.mp4} & 10.31 & 0.80 & $560^\circ/\text{s}$ & 89\% & Exotropia & \texttt{REFER} (Inward jump) \\
-\texttt{04\_hypertropia.mp4} & 1.20 & 7.22 & $253^\circ/\text{s}$ & 96\% & Hypertropia & \texttt{REFER} (Vertical jump) \\
+\texttt{01\_normal.mp4} & 1.82 & 0.50 & $109^\circ/\text{s}$ & 100\% & Orthophoria & \texttt{NORMAL} ($<3.5$ noise floor) \\
+\texttt{02\_esotropia.mp4} & 26.40 & 1.10 & $320^\circ/\text{s}$ & 96\% & Left Esotropia & \texttt{REFER} (Outward jump) \\
+\texttt{03\_exotropia.mp4} & 11.56 & 0.80 & $326^\circ/\text{s}$ & 89\% & Exotropia & \texttt{REFER} (Inward jump) \\
+\texttt{04\_hypertropia.mp4} & 1.20 & 7.45 & $253^\circ/\text{s}$ & 96\% & Hypertropia & \texttt{REFER} (Vertical jump) \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -215,7 +215,7 @@ DualGazeStrabismusNet & 5-class probability & 72.8\% val / 87.5\% & Static triag
 \end{tabularx}
 \end{table}
 
-\textbf{Graphical Trajectory and Motility Analysis:} Figure~\ref{fig:cover_plot} displays the automated Cover-Uncover curves generated for \texttt{02\_esotropia.mp4}, clearly capturing inter-ocular misalignment beyond the $\pm 6\,\Delta\text{PD}$ normal envelope alongside distinct refixation transitions upon occlusion. Figure~\ref{fig:cardinal_plot} illustrates a 9-Cardinal Gaze $3\times3$ motility heatmap and Hess-style disparity vector plot from a live test session, exposing a borderline incomitant spread of $6.4\,\Delta\text{PD}$ across upward and lateral gaze fields.
+\textbf{Graphical Trajectory and Motility Analysis:} Figure~\ref{fig:cover_plot} displays the automated Cover-Uncover curves generated for \texttt{02\_esotropia.mp4}, clearly capturing inter-ocular misalignment beyond the $\pm 6\,\Delta\text{PD}$ normal envelope alongside distinct refixation transitions upon occlusion. Figure~\ref{fig:cardinal_plot} illustrates a complete 9-Cardinal Gaze $3\times3$ motility heatmap and Hess-style disparity vector plot from a live test session, confirming comitant conjugate motility with a $3.1\,\Delta\text{PD}$ spread across all nine gaze fields.
 
 \begin{figure}[H]
     \centering
@@ -229,12 +229,12 @@ DualGazeStrabismusNet & 5-class probability & 72.8\% val / 87.5\% & Static triag
     \begin{minipage}[t]{0.485\textwidth}
         \centering
         \includegraphics[width=\textwidth]{figures/cardinal_gaze_matrix.png}
-        \caption{9-Cardinal Gaze $3\times3$ heatmap (left) and Hess-style conjugate disparity plot (right) indicating $6.4\,\Delta\text{PD}$ borderline incomitancy.}
+        \caption{9-Cardinal Gaze $3\times3$ heatmap (left) and Hess-style conjugate disparity plot (right) confirming \texttt{COMITANT} alignment ($3.1\,\Delta\text{PD}$ spread).}
         \label{fig:cardinal_plot}
     \end{minipage}
 \end{figure}
 
-\textbf{Discussion of Failure Cases and Mitigation:} Three failure modes were identified and resolved during development. First, eyelid distortion from occluder contact caused spurious $12^\circ$ jumps; fellow-eye isolation eliminated this error. Second, natural blinking creates transient aperture drops that mimic vertical saccades; windowed median filtering in \texttt{RockSolidFilter} combined with physiological contrast gating suppresses blink spikes, while the $3.5\,\Delta\text{PD}$ noise floor prevents healthy micro-tremors ($3.17\,\Delta\text{PD}$ in \texttt{01\_normal.mp4}) from triggering false referrals. Third, our static 2D Siamese classifier achieved only $42.1\%$ sensitivity on \texttt{HYPOTROPIA} because downward eye turn in uncalibrated crops visually mimics mild ptosis or chin tilt; the live 3D 9-Cardinal Gaze pipeline resolves this ambiguity using explicit 3D head-pose decoupling.
+\textbf{Discussion of Failure Cases and Mitigation:} Three failure modes were identified and resolved during development. First, eyelid distortion from occluder contact caused spurious $12^\circ$ jumps; fellow-eye isolation eliminated this error. Second, natural blinking creates transient aperture drops that mimic vertical saccades; windowed median filtering in \texttt{RockSolidFilter} combined with physiological contrast gating suppresses blink spikes, while the $3.5\,\Delta\text{PD}$ noise floor prevents healthy micro-tremors ($1.82\,\Delta\text{PD}$ in \texttt{01\_normal.mp4}) from triggering false referrals. Third, our static 2D Siamese classifier achieved only $42.1\%$ sensitivity on \texttt{HYPOTROPIA} because downward eye turn in uncalibrated crops visually mimics mild ptosis or chin tilt; the live 3D 9-Cardinal Gaze pipeline resolves this ambiguity using explicit 3D head-pose decoupling.
 
 % ==============================================================================
 % 7. CONCLUSION AND FUTURE WORK (~0.5 PAGES)

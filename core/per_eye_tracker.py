@@ -184,6 +184,8 @@ class PerEyeTracker:
         self.filter_od_pitch = RockSolidFilter()
         self.filter_os_yaw = RockSolidFilter()
         self.filter_os_pitch = RockSolidFilter()
+        self.filter_od_iris_px = RockSolidFilter(window_size=5, alpha_still=0.10, alpha_move=0.35, deadband=0.15, saccade_thresh=2.0)
+        self.filter_os_iris_px = RockSolidFilter(window_size=5, alpha_still=0.10, alpha_move=0.35, deadband=0.15, saccade_thresh=2.0)
         self.filter_screen_x = RockSolidFilter(init_val=screen_w / 2, alpha_still=0.30, alpha_move=0.90)
         self.filter_screen_y = RockSolidFilter(init_val=screen_h / 2, alpha_still=0.30, alpha_move=0.90)
 
@@ -200,6 +202,8 @@ class PerEyeTracker:
         self.filter_od_pitch.reset()
         self.filter_os_yaw.reset()
         self.filter_os_pitch.reset()
+        self.filter_od_iris_px.reset()
+        self.filter_os_iris_px.reset()
         self.filter_screen_x.reset(self.screen_w / 2)
         self.filter_screen_y.reset(self.screen_h / 2)
         self.cover_history.clear()
@@ -238,10 +242,12 @@ class PerEyeTracker:
         pb = np.array([lms[idx_bottom].x * w, lms[idx_bottom].y * h], dtype=np.float64)
         p_iris = np.array([lms[idx_iris].x * w, lms[idx_iris].y * h], dtype=np.float64)
 
-        # Iris horizontal diameter in pixels
+        # Iris horizontal diameter in pixels (smoothed to suppress 1-2 px border jitter at corners)
         p_br = np.array([lms[idx_iris_borders[0]].x * w, lms[idx_iris_borders[0]].y * h])
         p_bl = np.array([lms[idx_iris_borders[2]].x * w, lms[idx_iris_borders[2]].y * h])
-        iris_width_px = float(np.linalg.norm(p_br - p_bl))
+        raw_iris_px = float(np.linalg.norm(p_br - p_bl))
+        iris_filter = self.filter_od_iris_px if is_right_eye else self.filter_os_iris_px
+        iris_width_px = iris_filter.update(raw_iris_px)
 
         canthi_vec = pi - po
         canthi_dist = float(np.linalg.norm(canthi_vec))
@@ -516,13 +522,13 @@ class PerEyeTracker:
         h_pd = float(h_deg * PD_PER_DEGREE)
         v_pd = float(v_deg * PD_PER_DEGREE)
 
-        # Screen gaze coordinates (X, Y)
+        # Screen gaze coordinates (X, Y): rightward gaze is positive (+), leftward is negative (-)
         if eye_covered == "OD":
             gaze_yaw, gaze_pitch = smooth_os_yaw, smooth_os_pitch
         elif eye_covered == "OS":
-            gaze_yaw, gaze_pitch = smooth_od_yaw, smooth_od_pitch
+            gaze_yaw, gaze_pitch = -smooth_od_yaw, smooth_od_pitch
         else:
-            gaze_yaw = 0.5 * (smooth_od_yaw - smooth_os_yaw)
+            gaze_yaw = 0.5 * (smooth_os_yaw - smooth_od_yaw)
             gaze_pitch = 0.5 * (smooth_od_pitch + smooth_os_pitch)
 
         total_yaw = gaze_yaw + head_yaw * 0.35
