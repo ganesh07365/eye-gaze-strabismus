@@ -294,11 +294,10 @@ class PerEyeTracker:
             crop_mean = 0.0
 
         # Physiological open eye criteria:
-        # 1. Aperture is at least 13% of eye width (relaxed to handle all eye shapes)
-        # 2. Eye crop has texture variance (std >= 8.0, eliminating flat occluding cards/paddles)
-        # 3. Dynamic contrast >= 14.0 (dark pupil vs bright sclera/skin)
-        # 4. Crop mean brightness >= 35.0 (eliminating dark opaque occluders)
-        is_open = (aperture >= 0.13) and (crop_std >= 8.0) and (contrast >= 14.0) and (crop_mean >= 35.0)
+        # 1. Aperture is at least 13% of eye width (palpebral fissure height / canthal distance)
+        # 2. Eye crop is not a pitch-black occluder (crop_mean >= 15.0)
+        # 3. Eye crop has texture / contrast (not a completely flat card/paddle)
+        is_open = (aperture >= 0.13) and (crop_mean >= 15.0) and (contrast >= 6.0 or crop_std >= 4.0)
 
         return {
             "yaw_deg": yaw_deg,
@@ -334,10 +333,13 @@ class PerEyeTracker:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-        # ROI brightness difference for paddle occluder detection
-        l_roi = gray[int(h*0.2):int(h*0.8), :int(w*0.45)]
-        r_roi = gray[int(h*0.2):int(h*0.8), int(w*0.55):]
-        roi_diff = float(np.mean(r_roi) - np.mean(l_roi)) if l_roi.size > 0 and r_roi.size > 0 else 0.0
+        # ROI brightness difference for paddle occluder detection in close-up clinical videos
+        if self.auto_pad_crop:
+            l_roi = gray[int(h*0.2):int(h*0.8), :int(w*0.45)]
+            r_roi = gray[int(h*0.2):int(h*0.8), int(w*0.55):]
+            roi_diff = float(np.mean(r_roi) - np.mean(l_roi)) if l_roi.size > 0 and r_roi.size > 0 else 0.0
+        else:
+            roi_diff = 0.0
 
         if self.auto_pad_crop:
             pad_t = int(h * 0.45)
@@ -357,8 +359,9 @@ class PerEyeTracker:
 
         if not detection_result.face_landmarks:
             raw_cover = "NONE"
-            if roi_diff > 25: raw_cover = "OD"
-            elif roi_diff < -25: raw_cover = "OS"
+            if self.auto_pad_crop:
+                if roi_diff > 25: raw_cover = "OD"
+                elif roi_diff < -25: raw_cover = "OS"
             self.cover_history.append(raw_cover)
             return PerEyeFrameResult(
                 timestamp_ms=timestamp_ms,
@@ -413,16 +416,18 @@ class PerEyeTracker:
         od_open = od["is_open"]
         os_open = os_eye["is_open"]
 
-        if roi_diff > 25:
-            raw_cover = "OD"
-        elif roi_diff < -25:
-            raw_cover = "OS"
-        elif od_open and not os_open:
+        # Multi-cue Occlusion & Eye-Closure Logic:
+        # 1. Direct ocular openness (aperture EAR, iris boundary, and texture)
+        if od_open and not os_open:
             raw_cover = "OS"
         elif os_open and not od_open:
             raw_cover = "OD"
         elif not od_open and not os_open:
             raw_cover = "BOTH"
+        elif self.auto_pad_crop and roi_diff > 25:
+            raw_cover = "OD"
+        elif self.auto_pad_crop and roi_diff < -25:
+            raw_cover = "OS"
         else:
             raw_cover = "NONE"
 
